@@ -3021,42 +3021,45 @@ function OpenColorPicker()
     local sg = Instance.new("ScreenGui")
     sg.Name = "ColorPicker"
     sg.ResetOnSpawn = false; sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.IgnoreGuiInset = true
     sg.Parent = CoreGui
     _G.UH_ColorPicker = sg
     local win = Instance.new("Frame")
-    win.Size = UDim2.new(0, 360, 0, 320)
-    win.Position = UDim2.new(0.5, -180, 0.5, -160)
+    win.Size = UDim2.new(0, 380, 0, 360)
+    win.Position = UDim2.new(0.5, -190, 0.5, -180)
     win.BackgroundColor3 = Color3.fromRGB(28,30,38); win.BorderSizePixel = 0
+    win.ZIndex = 5
     win.Parent = sg; Instance.new("UICorner", win).CornerRadius = UDim.new(0, 10)
     local ws = Instance.new("UIStroke", win)
     ws.Thickness = 2; ws.Color = Color3.fromRGB(180,80,255)
     -- 标题栏 (可拖拽)
     local tbar = Instance.new("Frame")
     tbar.Size = UDim2.new(1, 0, 0, 32); tbar.BackgroundColor3 = Color3.fromRGB(38,40,50)
-    tbar.BorderSizePixel = 0; tbar.Parent = win
+    tbar.BorderSizePixel = 0; tbar.ZIndex = 6; tbar.Parent = win
     Instance.new("UICorner", tbar).CornerRadius = UDim.new(0, 10)
     local ttl = Instance.new("TextLabel")
     ttl.Size = UDim2.new(1, -50, 1, 0); ttl.Position = UDim2.new(0, 10, 0, 0)
     ttl.BackgroundTransparency = 1; ttl.Text = "锁定方框颜色调节"
     ttl.TextColor3 = Color3.fromRGB(255,255,255); ttl.Font = Enum.Font.GothamBold; ttl.TextSize = 14
-    ttl.TextXAlignment = Enum.TextXAlignment.Left; ttl.Parent = tbar
+    ttl.TextXAlignment = Enum.TextXAlignment.Left; ttl.ZIndex = 7; ttl.Parent = tbar
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 28, 0, 24); closeBtn.Position = UDim2.new(1, -34, 0.5, -12)
     closeBtn.BackgroundColor3 = Color3.fromRGB(200,60,60); closeBtn.Text = "X"
     closeBtn.TextColor3 = Color3.fromRGB(255,255,255); closeBtn.Font = Enum.Font.GothamBold; closeBtn.TextSize = 12
-    closeBtn.Parent = tbar; Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+    closeBtn.ZIndex = 7; closeBtn.Parent = tbar; Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
     closeBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
 
-    local SV_SIZE = 200
-    -- 左侧颜色选择方框 (TextButton可点击, Hue水平 × Saturation垂直)
+    local SV_SIZE = 220
+    -- 左侧颜色选择方框: H(水平) × S(垂直)
+    -- 实现: 底层=当前Hue纯色, 上层白色渐变(顶=白,底=透明) -> 顶部白底部纯色
     local svBox = Instance.new("TextButton")
     svBox.Size = UDim2.new(0, SV_SIZE, 0, SV_SIZE)
     svBox.Position = UDim2.new(0, 12, 0, 42)
     svBox.BackgroundColor3 = Color3.fromRGB(255,0,0)
     svBox.BorderSizePixel = 0; svBox.Text = ""; svBox.AutoButtonColor = false
-    svBox.Parent = win
+    svBox.ZIndex = 5; svBox.Parent = win
     Instance.new("UICorner", svBox).CornerRadius = UDim.new(0, 6)
-    -- 底层: 水平hue渐变 (显示所有颜色)
+    -- Hue 水平渐变 (显示所有颜色光谱)
     local hueGrad = Instance.new("UIGradient", svBox)
     hueGrad.Rotation = 0
     hueGrad.Color = ColorSequence.new({
@@ -3068,106 +3071,131 @@ function OpenColorPicker()
         ColorSequenceKeypoint.new(0.83, Color3.fromHSV(0.83, 1, 1)),
         ColorSequenceKeypoint.new(1,    Color3.fromHSV(1, 1, 1)),
     })
-    -- 顶层: 白色saturation覆盖 (垂直, 顶部不透明白→底部透明, Active=false不挡点击)
+    -- Saturation 覆盖: 白→透明 (顶白, 底显示纯色) + 透明→黑 (顶透明, 底黑)
+    -- 用两个 Frame 叠加实现完整 SV 选择
     local satOverlay = Instance.new("Frame")
     satOverlay.Size = UDim2.new(1, 0, 1, 0)
     satOverlay.BackgroundColor3 = Color3.fromRGB(255,255,255); satOverlay.BorderSizePixel = 0
-    satOverlay.Active = false; satOverlay.ZIndex = 2
-    satOverlay.Parent = svBox
+    satOverlay.ZIndex = 6; satOverlay.Parent = svBox
     Instance.new("UICorner", satOverlay).CornerRadius = UDim.new(0, 6)
     local satGrad = Instance.new("UIGradient", satOverlay)
-    satGrad.Rotation = 90
+    satGrad.Rotation = 90  -- 从上到下
     satGrad.Color = ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.fromRGB(255,255,255)),
         ColorSequenceKeypoint.new(1, Color3.fromRGB(255,255,255)),
     })
     satGrad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0),
-        NumberSequenceKeypoint.new(1, 1),
+        NumberSequenceKeypoint.new(0, 0),    -- 顶部白色不透明 (S=0)
+        NumberSequenceKeypoint.new(1, 1),    -- 底部透明 (S=1, 显示纯色)
     })
-    -- 颜色选择圆圈 (ZIndex高, 显示在最上层)
+    -- Value 覆盖: 黑色渐变 (顶透明, 底不透明黑)
+    local valOverlay = Instance.new("Frame")
+    valOverlay.Size = UDim2.new(1, 0, 1, 0)
+    valOverlay.BackgroundColor3 = Color3.fromRGB(0,0,0); valOverlay.BorderSizePixel = 0
+    valOverlay.ZIndex = 7; valOverlay.Parent = svBox
+    Instance.new("UICorner", valOverlay).CornerRadius = UDim.new(0, 6)
+    local valGrad = Instance.new("UIGradient", valOverlay)
+    valGrad.Rotation = 90
+    valGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(0,0,0)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(0,0,0)),
+    })
+    valGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),    -- 顶部透明 (V=1)
+        NumberSequenceKeypoint.new(1, 0),    -- 底部黑色不透明 (V=0)
+    })
+    -- 颜色选择圆圈 (ZIndex最高, 显示在最上层)
     local dot = Instance.new("Frame")
     dot.Size = UDim2.new(0, 14, 0, 14)
     dot.BackgroundColor3 = Color3.fromRGB(255,255,255); dot.BorderSizePixel = 0
-    dot.ZIndex = 10; dot.Active = false; dot.Parent = svBox
+    dot.ZIndex = 20; dot.Parent = svBox
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
     local dotStroke = Instance.new("UIStroke", dot)
     dotStroke.Thickness = 2; dotStroke.Color = Color3.fromRGB(0,0,0)
 
-    -- 右侧亮度长条 (TextButton可点击)
-    local bar = Instance.new("TextButton")
-    bar.Size = UDim2.new(0, 28, 0, SV_SIZE)
-    bar.Position = UDim2.new(0, 222, 0, 42)
-    bar.BackgroundColor3 = Color3.fromRGB(255,255,255); bar.BorderSizePixel = 0
-    bar.Text = ""; bar.AutoButtonColor = false; bar.Parent = win
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 4)
-    local barGrad = Instance.new("UIGradient", bar)
-    barGrad.Rotation = 90
-    barGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255,255,255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(0,0,0)),
+    -- 右侧 Hue 色相条 (垂直彩虹)
+    local hueBar = Instance.new("TextButton")
+    hueBar.Size = UDim2.new(0, 28, 0, SV_SIZE)
+    hueBar.Position = UDim2.new(0, 244, 0, 42)
+    hueBar.BackgroundColor3 = Color3.fromRGB(255,255,255); hueBar.BorderSizePixel = 0
+    hueBar.Text = ""; hueBar.AutoButtonColor = false; hueBar.ZIndex = 5; hueBar.Parent = win
+    Instance.new("UICorner", hueBar).CornerRadius = UDim.new(0, 4)
+    local hueBarGrad = Instance.new("UIGradient", hueBar)
+    hueBarGrad.Rotation = 90
+    hueBarGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,    Color3.fromHSV(0, 1, 1)),
+        ColorSequenceKeypoint.new(0.17, Color3.fromHSV(0.17, 1, 1)),
+        ColorSequenceKeypoint.new(0.33, Color3.fromHSV(0.33, 1, 1)),
+        ColorSequenceKeypoint.new(0.5,  Color3.fromHSV(0.5, 1, 1)),
+        ColorSequenceKeypoint.new(0.67, Color3.fromHSV(0.67, 1, 1)),
+        ColorSequenceKeypoint.new(0.83, Color3.fromHSV(0.83, 1, 1)),
+        ColorSequenceKeypoint.new(1,    Color3.fromHSV(1, 1, 1)),
     })
-    -- 亮度圆圈
-    local bdot = Instance.new("Frame")
-    bdot.Size = UDim2.new(1, 4, 0, 12)
-    bdot.BackgroundColor3 = Color3.fromRGB(255,255,255); bdot.BorderSizePixel = 0
-    bdot.ZIndex = 10; bdot.Active = false; bdot.Parent = bar
-    Instance.new("UICorner", bdot).CornerRadius = UDim.new(1, 0)
-    local bdotStroke = Instance.new("UIStroke", bdot)
-    bdotStroke.Thickness = 2; bdotStroke.Color = Color3.fromRGB(0,0,0)
+    local hdot = Instance.new("Frame")
+    hdot.Size = UDim2.new(1, 4, 0, 12)
+    hdot.BackgroundColor3 = Color3.fromRGB(255,255,255); hdot.BorderSizePixel = 0
+    hdot.ZIndex = 20; hdot.Parent = hueBar
+    Instance.new("UICorner", hdot).CornerRadius = UDim.new(1, 0)
+    local hdotStroke = Instance.new("UIStroke", hdot)
+    hdotStroke.Thickness = 2; hdotStroke.Color = Color3.fromRGB(0,0,0)
 
     -- 颜色预览块
     local preview = Instance.new("Frame")
-    preview.Size = UDim2.new(0, 50, 0, 40); preview.Position = UDim2.new(0, 262, 0, 42)
+    preview.Size = UDim2.new(0, 80, 0, 40); preview.Position = UDim2.new(0, 282, 0, 42)
     preview.BackgroundColor3 = Color3.fromRGB(255,255,255); preview.BorderSizePixel = 0
-    preview.Parent = win; Instance.new("UICorner", preview).CornerRadius = UDim.new(0, 6)
+    preview.ZIndex = 5; preview.Parent = win; Instance.new("UICorner", preview).CornerRadius = UDim.new(0, 6)
     local previewLbl = Instance.new("TextLabel")
     previewLbl.Size = UDim2.new(1, 0, 0, 16); previewLbl.Position = UDim2.new(0, 0, 1, -16)
     previewLbl.BackgroundTransparency = 0.3; previewLbl.Text = "预览"
     previewLbl.TextColor3 = Color3.fromRGB(255,255,255); previewLbl.Font = Enum.Font.Gotham; previewLbl.TextSize = 10
-    previewLbl.Parent = preview
+    previewLbl.ZIndex = 6; previewLbl.Parent = preview
 
     -- RGB显示 + Hex输入
     local codeLbl = Instance.new("TextLabel")
-    codeLbl.Size = UDim2.new(0, 200, 0, 20); codeLbl.Position = UDim2.new(0, 12, 0, 252)
+    codeLbl.Size = UDim2.new(0, 200, 0, 20); codeLbl.Position = UDim2.new(0, 12, 0, 280)
     codeLbl.BackgroundTransparency = 1; codeLbl.Text = "RGB: 255,255,255"
     codeLbl.TextColor3 = Color3.fromRGB(230,230,230); codeLbl.Font = Enum.Font.Gotham; codeLbl.TextSize = 12
-    codeLbl.TextXAlignment = Enum.TextXAlignment.Left; codeLbl.Parent = win
+    codeLbl.TextXAlignment = Enum.TextXAlignment.Left; codeLbl.ZIndex = 6; codeLbl.Parent = win
     local codeBox = Instance.new("TextBox")
-    codeBox.Size = UDim2.new(0, 100, 0, 26); codeBox.Position = UDim2.new(0, 12, 0, 276)
+    codeBox.Size = UDim2.new(0, 100, 0, 26); codeBox.Position = UDim2.new(0, 12, 0, 306)
     codeBox.BackgroundColor3 = Color3.fromRGB(40,42,50); codeBox.Text = "FFFFFF"
     codeBox.TextColor3 = Color3.fromRGB(255,255,255); codeBox.Font = Enum.Font.Gotham; codeBox.TextSize = 12
-    codeBox.ClearTextOnFocus = false; codeBox.Parent = win
+    codeBox.ClearTextOnFocus = false; codeBox.ZIndex = 6; codeBox.Parent = win
     Instance.new("UICorner", codeBox).CornerRadius = UDim.new(0, 4)
 
-    -- 确定按钮
+    -- 确定按钮 (ZIndex提高, 确保可点击)
     local okBtn = Instance.new("TextButton")
-    okBtn.Size = UDim2.new(0, 80, 0, 28); okBtn.Position = UDim2.new(1, -92, 1, -38)
+    okBtn.Size = UDim2.new(0, 80, 0, 32); okBtn.Position = UDim2.new(1, -92, 1, -42)
     okBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 100); okBtn.Text = "确定"
-    okBtn.TextColor3 = Color3.fromRGB(255,255,255); okBtn.Font = Enum.Font.GothamBold; okBtn.TextSize = 13
-    okBtn.Parent = win; Instance.new("UICorner", okBtn).CornerRadius = UDim.new(0, 6)
+    okBtn.TextColor3 = Color3.fromRGB(255,255,255); okBtn.Font = Enum.Font.GothamBold; okBtn.TextSize = 14
+    okBtn.ZIndex = 15; okBtn.Parent = win; Instance.new("UICorner", okBtn).CornerRadius = UDim.new(0, 6)
+
+    -- 取消按钮
+    local cancelBtn = Instance.new("TextButton")
+    cancelBtn.Size = UDim2.new(0, 80, 0, 32); cancelBtn.Position = UDim2.new(1, -178, 1, -42)
+    cancelBtn.BackgroundColor3 = Color3.fromRGB(120, 60, 60); cancelBtn.Text = "取消"
+    cancelBtn.TextColor3 = Color3.fromRGB(255,255,255); cancelBtn.Font = Enum.Font.GothamBold; cancelBtn.TextSize = 14
+    cancelBtn.ZIndex = 15; cancelBtn.Parent = win; Instance.new("UICorner", cancelBtn).CornerRadius = UDim.new(0, 6)
+    cancelBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
 
     -- 当前HSV值
     local curH, curS, curV = 0, 1, 1
 
     local function UpdateUI()
         local c = Color3.fromHSV(curH, curS, curV)
-        -- 更新亮度条渐变 (顶部=当前色全亮, 底部=黑)
-        barGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromHSV(curH, curS, 1)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(0,0,0)),
-        })
+        -- SV方框底层颜色 = 当前Hue纯色
+        svBox.BackgroundColor3 = Color3.fromHSV(curH, 1, 1)
         preview.BackgroundColor3 = c
         local r, g, b = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5)
         codeLbl.Text = string.format("RGB: %d,%d,%d", r, g, b)
         codeBox.Text = string.format("%02X%02X%02X", r, g, b)
-        -- 更新圆圈位置 (saturation: top=S0白, bottom=S1纯色, 所以Y=(1-S)*size)
+        -- SV圆圈: X=H, Y=(1-S)
         dot.Position = UDim2.new(0, curH * SV_SIZE - 7, 0, (1 - curS) * SV_SIZE - 7)
-        -- brightness: top=V1亮, bottom=V0黑, 所以Y=(1-V)*size
-        bdot.Position = UDim2.new(0, -2, 0, (1 - curV) * SV_SIZE - 6)
+        -- Hue圆圈: Y=H
+        hdot.Position = UDim2.new(0, -2, 0, curH * SV_SIZE - 6)
     end
 
-    -- SV方框拖拽 (用MouseButton1Down+InputChanged, 点击和拖动都更新)
+    -- SV方框拖拽
     local svDrag = false
     local function updateSVFromMouse(pos)
         local relX = pos.X - svBox.AbsolutePosition.X
@@ -3184,36 +3212,35 @@ function OpenColorPicker()
     svBox.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.Touch then svDrag = true; updateSVFromMouse(i.Position) end
     end)
-    -- 亮度条拖拽
-    local bDrag = false
-    local function updateBFromMouse(pos)
-        local relY = pos.Y - bar.AbsolutePosition.Y
-        curV = math.clamp(1 - relY / SV_SIZE, 0, 1)
+    -- Hue色相条拖拽
+    local hDrag = false
+    local function updateHueFromMouse(pos)
+        local relY = pos.Y - hueBar.AbsolutePosition.Y
+        curH = math.clamp(relY / SV_SIZE, 0, 1)
         UpdateUI()
     end
-    bar.MouseButton1Down:Connect(function()
-        bDrag = true
+    hueBar.MouseButton1Down:Connect(function()
+        hDrag = true
         local mp = UserInputService:GetMouseLocation()
-        updateBFromMouse(mp)
+        updateHueFromMouse(mp)
     end)
-    bar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.Touch then bDrag = true; updateBFromMouse(i.Position) end
+    hueBar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then hDrag = true; updateHueFromMouse(i.Position) end
     end)
-    -- 统一InputChanged处理 (窗口销毁时自动断开)
+    -- 统一InputChanged处理
     local inputConn
     inputConn = UserInputService.InputChanged:Connect(function(i)
         if not win.Parent then inputConn:Disconnect() return end
         if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
             if svDrag then updateSVFromMouse(i.Position) end
-            if bDrag then updateBFromMouse(i.Position) end
+            if hDrag then updateHueFromMouse(i.Position) end
         end
     end)
-    -- InputEnded处理 (松开鼠标)
     local endConn
     endConn = UserInputService.InputEnded:Connect(function(i)
         if not win.Parent then endConn:Disconnect() return end
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            svDrag = false; bDrag = false
+            svDrag = false; hDrag = false
         end
     end)
     -- 颜色代码输入
