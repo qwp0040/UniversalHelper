@@ -210,16 +210,16 @@ local function GetNotifyConfig()
 end
 
 local function RepositionNotifs()
-    -- 从屏幕顶部向下排列, 第一个在顶部 50px 处
-    local yOff = 50
-    for i = 1, #ActiveNotifs do
+    -- 从屏幕右下角向上排列, 第一个在底部 10px 处
+    local yOff = 10
+    for i = #ActiveNotifs, 1, -1 do
         local e = ActiveNotifs[i]
         if e and e.Frame and e.Frame.Parent then
             local h = e.Height or 50
             e.TargetY = yOff
-            yOff = yOff + h + 8
+            yOff = yOff + h + 6
             TweenService:Create(e.Frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
-                Position = UDim2.new(0.5, -160, 0, e.TargetY)
+                Position = UDim2.new(1, -20, 1, -e.TargetY)
             }):Play()
         end
     end
@@ -245,64 +245,65 @@ local function ShowNotification(title, text, color)
 
     local notif = Instance.new("Frame")
     notif.Name = "NotifyItem"
-    notif.Size = UDim2.new(0, 320, 0, notifH)
-    notif.AnchorPoint = Vector2.new(0.5, 0)
+    notif.Size = UDim2.new(0, 300, 0, notifH)
+    notif.AnchorPoint = Vector2.new(1, 1)  -- 从右下角定位
     notif.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
     notif.BorderSizePixel = 0
     notif.Parent = NotifyGui
 
     local border = Instance.new("Frame")
     border.Name = "NotifyBorder"
-    border.Size = UDim2.new(1, 0, 0, 3)
-    border.Position = UDim2.new(0, 0, 0, 0)
+    border.Size = UDim2.new(0, 4, 1, 0)
     border.BackgroundColor3 = color
     border.BorderSizePixel = 0
     border.Parent = notif
-    Instance.new("UICorner", notif).CornerRadius = UDim.new(0, 8)
-    Instance.new("UICorner", border).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", notif).CornerRadius = UDim.new(0, 6)
+    Instance.new("UICorner", border).CornerRadius = UDim.new(0, 6)
 
     local ttl = Instance.new("TextLabel")
     ttl.Name = "NotifyTitle"
-    ttl.Size = UDim2.new(1, -24, 0, 20)
+    ttl.Size = UDim2.new(1, -20, 0, 20)
     ttl.Position = UDim2.new(0, 12, 0, 6)
     ttl.BackgroundTransparency = 1
     ttl.Text = title
-    ttl.TextColor3 = color
+    ttl.TextColor3 = Color3.fromRGB(255,255,255)
     ttl.Font = Enum.Font.GothamBold
-    ttl.TextSize = 14
+    ttl.TextSize = 13
     ttl.TextXAlignment = Enum.TextXAlignment.Left
     ttl.Parent = notif
 
     local msg = Instance.new("TextLabel")
     msg.Name = "NotifyMsg"
-    msg.Size = UDim2.new(1, -24, 0, 18)
-    msg.Position = UDim2.new(0, 12, 0, 27)
+    msg.Size = UDim2.new(1, -20, 0, 20)
+    msg.Position = UDim2.new(0, 12, 0, 28)
     msg.BackgroundTransparency = 1
     msg.Text = text
-    msg.TextColor3 = Color3.fromRGB(230, 230, 235)
+    msg.TextColor3 = Color3.fromRGB(200, 200, 210)
     msg.Font = Enum.Font.Gotham
-    msg.TextSize = 12
+    msg.TextSize = 11
+    msg.TextWrapped = true
     msg.TextXAlignment = Enum.TextXAlignment.Left
     msg.Parent = notif
 
-    local entry = {Frame = notif, Height = notifH, TargetY = 50}
+    local startY = 10
+    local entry = {Frame = notif, Height = notifH, TargetY = startY}
     table.insert(ActiveNotifs, entry)
 
-    -- 从屏幕顶部上方滑入
-    notif.Position = UDim2.new(0.5, -160, 0, -notifH - 10)
-    TweenService:Create(notif, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0.5, -160, 0, 50)
+    -- 从屏幕右侧外滑入到右下角
+    notif.Position = UDim2.new(1, 320, 1, -startY)
+    TweenService:Create(notif, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = UDim2.new(1, -20, 1, -startY)
     }):Play()
 
     task.defer(RepositionNotifs)
 
-    -- 3秒后向上滑出并销毁
-    task.delay(3, function()
+    -- 3.5秒后向右滑出并销毁
+    task.delay(3.5, function()
         if not notif or not notif.Parent then return end
-        TweenService:Create(notif, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-            Position = UDim2.new(0.5, -160, 0, -notifH - 10)
+        TweenService:Create(notif, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Position = UDim2.new(1, 350, 1, notif.Position.Y.Offset)
         }):Play()
-        task.wait(0.45)
+        task.wait(0.55)
         if notif and notif.Parent then notif:Destroy() end
         for i, e in ipairs(ActiveNotifs) do
             if e == entry then table.remove(ActiveNotifs, i) break end
@@ -3015,6 +3016,11 @@ function OpenWeaponWindow()
     RefreshInfo()
 end
 
+-- 前向声明 (这些函数/表在后面定义, 但按钮回调和颜色选择器需要引用)
+local Combat
+local UpdateLockColor
+local GetAllTargets
+
 -- 颜色选择器 (HSV色板+亮度条+颜色代码)
 function OpenColorPicker()
     pcall(function() if _G.UH_ColorPicker then _G.UH_ColorPicker:Destroy() end end)
@@ -3476,28 +3482,6 @@ local lockModeBtn = MakeButton(CmbPage, "锁定模式: 全部 (点击切换)", f
     Combat.Target = nil
     lockModeBtn.Text = "锁定模式: " .. names[Config.CombatLockMode] .. " (点击切换)"
     ShowNotification("锁定模式", "已切换为: " .. names[Config.CombatLockMode], Color3.fromRGB(100,220,180))
-end)
--- 切换目标按钮: 手动切换到下一个目标
-MakeButton(CmbPage, "切换目标 (Tab键)", function()
-    local all = GetAllTargets()
-    if #all == 0 then
-        ShowNotification("切换目标", "当前无可用目标", Color3.fromRGB(255,150,80))
-        return
-    end
-    -- 找到当前目标的下一个
-    local nextTarget = all[1]
-    if Combat.Target then
-        local curModel = Combat.Target.model
-        for i, t in ipairs(all) do
-            if t.model == curModel then
-                nextTarget = all[(i % #all) + 1]
-                break
-            end
-        end
-    end
-    Combat.Target = nextTarget
-    local name = nextTarget.type == "Player" and "玩家" or "NPC"
-    ShowNotification("切换目标", "已锁定: " .. name, Color3.fromRGB(100,220,180))
 end)
 local lockPartBtn = MakeButton(CmbPage, "锁定部位: 身体 (点击切换)", function()
     Config.CombatLockPart = (Config.CombatLockPart or 1) % 2 + 1
@@ -4051,7 +4035,7 @@ local function ApplyAutoFire()
 end
 
 -- ============== 格斗系统 (自动面朝+视角锁定+预判) ==============
-local Combat = {
+Combat = {
     Target = nil,  -- 锁定的目标 (Character或Model)
     LockGui = nil, -- 旋转方框GUI
     ArrowGui = nil, -- 屏幕外箭头GUI
@@ -4060,7 +4044,7 @@ local Combat = {
 }
 
 -- 获取所有可能的目标 (按锁定模式过滤: 1=全部 2=仅玩家 3=仅NPC)
-local function GetAllTargets()
+GetAllTargets = function()
     local list = {}
     local mode = Config.CombatLockMode or 1
     -- 玩家
@@ -4179,7 +4163,7 @@ local function CreateCombatLockUI()
 end
 
 -- 更新锁定方框颜色
-local function UpdateLockColor()
+UpdateLockColor = function()
     if Combat.LockBox then
         local c = Color3.fromRGB(Config.CombatLockColorR, Config.CombatLockColorG, Config.CombatLockColorB)
         for _, edge in ipairs(Combat.LockBox:GetChildren()) do
@@ -4337,27 +4321,6 @@ local function SetupCombatHotkey()
                 end
                 ShowNotification("格斗", "自动面朝已" .. (Config.CombatFaceTarget and "开启" or "关闭"), Color3.fromRGB(180,80,255))
             end
-        end
-        -- Tab键切换目标
-        if keyName == "Tab" and Config.CombatEnabled then
-            local all = GetAllTargets()
-            if #all == 0 then
-                ShowNotification("切换目标", "当前无可用目标", Color3.fromRGB(255,150,80))
-                return
-            end
-            local nextTarget = all[1]
-            if Combat.Target then
-                local curModel = Combat.Target.model
-                for i, t in ipairs(all) do
-                    if t.model == curModel then
-                        nextTarget = all[(i % #all) + 1]
-                        break
-                    end
-                end
-            end
-            Combat.Target = nextTarget
-            local name = nextTarget.type == "Player" and "玩家" or "NPC"
-            ShowNotification("切换目标", "已锁定: " .. name, Color3.fromRGB(100,220,180))
         end
     end)
 end
