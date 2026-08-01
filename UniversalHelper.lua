@@ -2257,15 +2257,18 @@ local function MakeSlider(page, text, minv, maxv, default, step, callback, liveA
         if liveApplyFunc then liveApplyFunc() end
     end
     slider.MouseButton1Down:Connect(function() dragging = true end)
+    slider.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then dragging = true; update(i.Position.X) end
+    end)
     -- 连接绑定到slider销毁时自动清理 (避免每个slider泄漏2个永久连接)
     local inputEndedConn, inputChangedConn
     inputEndedConn = UserInputService.InputEnded:Connect(function(i)
         if not slider.Parent then inputEndedConn:Disconnect(); if inputChangedConn then inputChangedConn:Disconnect() end return end
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end)
     inputChangedConn = UserInputService.InputChanged:Connect(function(i)
         if not slider.Parent then inputChangedConn:Disconnect(); if inputEndedConn then inputEndedConn:Disconnect() end return end
-        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             update(i.Position.X)
         end
     end)
@@ -2869,14 +2872,17 @@ function OpenWeaponWindow()
                 if frozen then FreezeWeaponValue(obj, curVal) end
             end
             slider.MouseButton1Down:Connect(function() dragging = true; upd(UserInputService:GetMouseLocation().X) end)
+            slider.InputBegan:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch then dragging = true; upd(i.Position.X) end
+            end)
             local ec, cc
             ec = UserInputService.InputEnded:Connect(function(i)
                 if not slider.Parent then ec:Disconnect(); if cc then cc:Disconnect() end return end
-                if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+                if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
             end)
             cc = UserInputService.InputChanged:Connect(function(i)
                 if not slider.Parent then cc:Disconnect(); if ec then ec:Disconnect() end return end
-                if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then upd(i.Position.X) end
+                if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then upd(i.Position.X) end
             end)
         end
     end
@@ -2980,15 +2986,15 @@ function OpenWeaponWindow()
     -- 拖拽
     local dragging, dragStart, startPos = false, nil, nil
     tbar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             dragging = true; dragStart = i.Position; startPos = win.Position
         end
     end)
     tbar.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end)
     UserInputService.InputChanged:Connect(function(i)
-        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
             win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
@@ -3175,6 +3181,9 @@ function OpenColorPicker()
         local mp = UserInputService:GetMouseLocation()
         updateSVFromMouse(mp)
     end)
+    svBox.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then svDrag = true; updateSVFromMouse(i.Position) end
+    end)
     -- 亮度条拖拽
     local bDrag = false
     local function updateBFromMouse(pos)
@@ -3187,11 +3196,14 @@ function OpenColorPicker()
         local mp = UserInputService:GetMouseLocation()
         updateBFromMouse(mp)
     end)
+    bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then bDrag = true; updateBFromMouse(i.Position) end
+    end)
     -- 统一InputChanged处理 (窗口销毁时自动断开)
     local inputConn
     inputConn = UserInputService.InputChanged:Connect(function(i)
         if not win.Parent then inputConn:Disconnect() return end
-        if i.UserInputType == Enum.UserInputType.MouseMovement then
+        if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
             if svDrag then updateSVFromMouse(i.Position) end
             if bDrag then updateBFromMouse(i.Position) end
         end
@@ -3200,7 +3212,7 @@ function OpenColorPicker()
     local endConn
     endConn = UserInputService.InputEnded:Connect(function(i)
         if not win.Parent then endConn:Disconnect() return end
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             svDrag = false; bDrag = false
         end
     end)
@@ -3229,15 +3241,15 @@ function OpenColorPicker()
     -- 拖拽窗口
     local dragging, dragStart, startPos = false, nil, nil
     tbar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             dragging = true; dragStart = i.Position; startPos = win.Position
         end
     end)
     tbar.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end)
     UserInputService.InputChanged:Connect(function(i)
-        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
             win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
@@ -3318,7 +3330,7 @@ function OpenCombatMiniUI()
             end
         end)
         row.InputBegan:Connect(function(i)
-            if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
                 setConfig(not getConfig())
             end
         end)
@@ -3349,15 +3361,15 @@ function OpenCombatMiniUI()
     -- 拖拽
     local dragging, dragStart, startPos = false, nil, nil
     tbar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             dragging = true; dragStart = i.Position; startPos = win.Position
         end
     end)
     tbar.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end)
     UserInputService.InputChanged:Connect(function(i)
-        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
             win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
@@ -3544,15 +3556,18 @@ MakeButton(SetPage, "调节 UI 大小 (点击打开)", function()
         Config.UIScale = val; UIScale.Scale = val
     end
     pSlider.MouseButton1Down:Connect(function() pDragging = true end)
+    pSlider.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then pDragging = true; pUpdate(i.Position.X) end
+    end)
     UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then pDragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then pDragging = false end
     end)
     UserInputService.InputChanged:Connect(function(i)
-        if pDragging and i.UserInputType == Enum.UserInputType.MouseMovement then pUpdate(i.Position.X) end
+        if pDragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then pUpdate(i.Position.X) end
     end)
     pClose.MouseButton1Click:Connect(function() ScaleGui:Destroy() end)
     Backdrop.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then ScaleGui:Destroy() end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then ScaleGui:Destroy() end
     end)
 end)
 
