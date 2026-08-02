@@ -44,6 +44,8 @@ local Config = {
     AutoDetectInteract=true,      -- 自动检测可互动对象(持续扫描填充列表, 无需手动点)
     AutoInteractSingleMode=false, -- 单选模式(仅互动选中的目标名称)
     AutoInteractKey=Enum.KeyCode.E, -- 自动互动按键(默认E, 可自定义)
+    PureAutoInteract=false,       -- 纯自动互动模式(开启后连续点按设定按键)
+    PureAutoInteractInterval=0.3, -- 纯自动点按间隔(秒)
     -- 自动修改(刷新互动增强)
     AutoModify=false,             -- 自动修改总开关(开启后慢速扫描+循环修改)
     AutoModifyMode=1,             -- 1=全部重复修改 2=单次修改模式
@@ -2511,6 +2513,47 @@ local function UpdatePromptDistances()
     end
 end
 
+-- 慢速扫描全树填充 Saved.Prompts 缓存 (开启远距离互动但未开快速互动/透视时用, 防止缓存为空导致远距离不生效)
+local function ScanAndCachePromptsAsync()
+    task.spawn(function()
+        local scanned = 0
+        local childrenIterated = 0
+        local queue = { Workspace }
+        while #queue > 0 and scanned < 800 do
+            local container = table.remove(queue, 1)
+            local valid = false
+            pcall(function() valid = container ~= nil and container.Parent ~= nil end)
+            if valid then
+                local children
+                pcall(function() children = container:GetChildren() end)
+                if children then
+                    for _, child in ipairs(children) do
+                        childrenIterated = childrenIterated + 1
+                        if childrenIterated >= 30 then
+                            childrenIterated = 0
+                            task.wait(0.1)
+                        end
+                        local cls
+                        pcall(function() cls = child.ClassName end)
+                        if cls == "ProximityPrompt" or cls == "ClickDetector" then
+                            pcall(ApplySmartInteract, child)
+                            scanned = scanned + 1
+                        else
+                            if cls and cls ~= "Camera" and cls ~= "Terrain" and cls ~= "Humanoid"
+                               and cls ~= "Script" and cls ~= "LocalScript" and cls ~= "ModuleScript"
+                               and cls ~= "Sound" and cls ~= "Weld" and cls ~= "WeldConstraint"
+                               and cls ~= "Motor6D" and cls ~= "Bone" and cls ~= "Animation"
+                               and #queue < 3000 then
+                                table.insert(queue, child)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
 local function CreateInteractHighlight(part)
     if not part or not part.Parent then return nil end
     if part:FindFirstChild("InteractHighlight") then return part:FindFirstChild("InteractHighlight") end
@@ -2711,6 +2754,7 @@ end
 -- do-end 块隔离 local 寄存器, 性能化设计: 慢速分批扫描, yield 防卡
 local StartAutoInteract, StopAutoInteract, RefreshInteractNames, GetInteractNames
 local StartAutoDetect, StopAutoDetect
+local StartPureAutoInteract, StopPureAutoInteract
 local StartAutoModify, StopAutoModify
 do
     local AI = {
@@ -2724,6 +2768,10 @@ do
         LastScanTime = 0,
     }
     local AD = {
+        Enabled = false,
+        LoopToken = 0,
+    }
+    local PA = {
         Enabled = false,
         LoopToken = 0,
     }
@@ -3054,6 +3102,62 @@ do
     StopAutoDetect = function()
         AD.Enabled = false
         AD.LoopToken = AD.LoopToken + 1
+    end
+
+    -- ====== 纯自动互动 (开启后连续点按设定按键, 不扫描不找对象, 纯按键模拟) ======
+    StartPureAutoInteract = function()
+        if PA.Enabled then return end
+        PA.Enabled = true
+        PA.LoopToken = PA.LoopToken + 1
+        local myToken = PA.LoopToken
+        task.spawn(function()
+            while PA.Enabled and PA.LoopToken == myToken do
+                if not Config.PureAutoInteract then return end
+                local useKey = Config.AutoInteractKey or Enum.KeyCode.E
+                -- 优先用执行器按键模拟函数 (覆盖面最广, 适配大多数游戏)
+                local ok = false
+                pcall(function()
+                    if keypress and keyrelease then
+                        keypress(useKey)
+                        task.wait(0.05)
+                        keyrelease(useKey)
+                        ok = true
+                    end
+                end)
+                -- 兜底: 模拟 ProximityPrompt 鼠标点击事件
+                if not ok then
+                    pcall(function()
+                        local char = LocalPlayer.Character
+                        if char then
+                            local root = char:FindFirstChild("HumanoidRootPart")
+                            if root then
+                                for prompt, _ in pairs(Saved.Prompts) do
+                                    pcall(function()
+                                        if prompt.Parent then
+                                            if prompt:IsA("ProximityPrompt") and fireproximityprompt then
+                                                fireproximityprompt(prompt, 0)
+                                            elseif prompt:IsA("ClickDetector") then
+                                                for _, conn in ipairs(getconnections(prompt.MouseClick) or {}) do
+                                                    pcall(function() conn:Fire(root) end)
+                                                end
+                                            end
+                                        end
+                                    end)
+                                end
+                            end
+                        end
+                    end)
+                end
+                local interval = Config.PureAutoInteractInterval
+                if type(interval) ~= "number" or interval < 0.05 then interval = 0.3 end
+                task.wait(interval)
+            end
+        end)
+    end
+
+    StopPureAutoInteract = function()
+        PA.Enabled = false
+        PA.LoopToken = PA.LoopToken + 1
     end
 
     -- ====== 自动修改系统 (刷新互动增强) ======
@@ -3885,8 +3989,14 @@ end)
 
 MakeLabel(InterPage, "== 远距离互动 ==")
 MakeToggle(InterPage, "远距离互动 (扩大互动范围)", false, function(v)
-    Config.LongRangeInteract = v; ApplyFastInteract(); StartSmartInteractListener()
-    ShowNotification("远距离互动", v and "已开启 (新刷新也会生效)" or "已关闭", v and Color3.fromRGB(255,200,80) or Color3.fromRGB(180,180,180))
+    Config.LongRangeInteract = v
+    ApplyFastInteract()
+    StartSmartInteractListener()
+    if v then
+        -- 独立扫描全树填充缓存 (防止未开快速互动/透视时缓存为空导致远距离不生效)
+        ScanAndCachePromptsAsync()
+    end
+    ShowNotification("远距离互动", v and "已开启 (慢速扫描填充中)" or "已关闭", v and Color3.fromRGB(255,200,80) or Color3.fromRGB(180,180,180))
 end)
 
 MakeLabel(InterPage, "== 互动透视 (慢速扫描防卡) ==")
@@ -3949,6 +4059,21 @@ end)
 MakeToggle(InterPage, "单选模式 (仅互动选中目标)", false, function(v)
     Config.AutoInteractSingleMode = v
     ShowNotification("单选模式", v and "已开启 (请在下方列表选目标)" or "已关闭 (互动全部匹配)", Color3.fromRGB(255, 200, 80))
+end)
+
+-- ====== 纯自动互动模式 (开启后连续点按设定按键, 不扫描不找对象) ======
+MakeToggle(InterPage, "纯自动互动模式 (开启后连续点按按键)", false, function(v)
+    Config.PureAutoInteract = v
+    if v then
+        StartPureAutoInteract()
+        ShowNotification("纯自动互动", "已开启 (连续点按设定按键)", Color3.fromRGB(255, 80, 80))
+    else
+        StopPureAutoInteract()
+        ShowNotification("纯自动互动", "已关闭", Color3.fromRGB(180, 180, 180))
+    end
+end)
+MakeSlider(InterPage, "纯自动点按间隔 (秒, 越小越快)", 0.05, 2, 0.3, 0.05, function(v)
+    Config.PureAutoInteractInterval = v
 end)
 
 -- 自动互动按键 (默认E, 可自定义)
@@ -5313,12 +5438,12 @@ MakeButton(SetPage, "关闭所有功能", function()
     Config.PlayerESP=false; Config.WallXray=false; Config.WallDetail=false; Config.NightVision=false
     Config.NPCESP=false; Config.SpeedEnabled=false; Config.JumpEnabled=false; Config.FlyEnabled=false
     Config.TeleWalk=false; Config.Noclip=false; Config.FastInteract=false; Config.InteractESP=false; Config.AutoRefresh=false
-    Config.AutoInteract=false; Config.AutoModify=false; Config.AutoModifyMode=1
+    Config.AutoInteract=false; Config.PureAutoInteract=false; Config.AutoModify=false; Config.AutoModifyMode=1
     Config.WallAutoRefresh=false; Config.InfiniteJump=false; Config.FloatMode=false; Config.GhostMode=false; Config.NPCKill=false
     ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
     if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
     Xray.RefreshConn = nil
-    pcall(StopAutoInteract); pcall(StopAutoDetect); pcall(StopAutoModify)
+    pcall(StopAutoInteract); pcall(StopAutoDetect); pcall(StopPureAutoInteract); pcall(StopAutoModify)
     ApplyNightVision(); ApplySpeed(); ApplyJump(); ApplyFly(); ApplyTeleWalk(); ApplyNoclip(); ApplyFastInteract()
     ApplyInfiniteJump(); ApplyFloat(); ApplyGhostMode()
     ShowNotification("设置", "已关闭所有功能", Color3.fromRGB(255, 100, 100))
@@ -5395,9 +5520,10 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         -- 关闭特效简化/超级简化 (还原所有修改)
         pcall(StopFXSimplify)
         pcall(StopSuperSimplify)
-        -- 关闭自动互动/自动检测/自动修改
+        -- 关闭自动互动/自动检测/纯自动互动/自动修改
         pcall(StopAutoInteract)
         pcall(StopAutoDetect)
+        pcall(StopPureAutoInteract)
         pcall(StopAutoModify)
         ApplyNightVision()
         local hum = GetHum()
