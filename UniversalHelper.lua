@@ -331,296 +331,269 @@ task.wait()
 -- ============== 服务器特效简化系统 (保留但不删除, 仅降低渲染负担) ==============
 -- 原理: 把粒子发射率/光束透明度/拖尾长度等参数调低, 特效仍存在但更轻量
 -- 慢速分批处理, 每帧只改 Config.FXBatchSize 个对象, 避免一次性扫描导致闪退
-local FX = {
-    Enabled = false,
-    Originals = {},       -- instance -> {prop=val,...} 保存原值用于还原
-    ProcessQueue = {},    -- 待扫描的容器
-    ScanConn = nil,
-    PendingChildConn = {},-- 监听新特效产生的连接
-    StatsCount = 0,
-    LoopToken = 0,        -- 协程令牌, 防止多个扫描协程同时运行
-}
+-- 整个系统包在 do...end 块内, 内部 helper 函数不占用主作用域 local 寄存器
+-- (避免触发 Luau "Out of local registers (exceeded limit 200)" 错误)
+-- 对外只暴露 StartFXSimplify / StopFXSimplify / FXRestart 三个 local
+local StartFXSimplify, StopFXSimplify, FXRestart
+do
+    local FX = {
+        Enabled = false,
+        Originals = {},       -- instance -> {prop=val,...} 保存原值用于还原
+        ProcessQueue = {},    -- 待扫描的容器
+        PendingChildConn = {},-- 监听新特效产生的连接
+        StatsCount = 0,
+        LoopToken = 0,        -- 协程令牌, 防止多个扫描协程同时运行
+    }
 
--- 安全读取 Instance 属性 (失败返回 nil)
-local function safeGet(obj, prop)
-    local ok, v = pcall(function() return obj[prop] end)
-    if ok then return v end
-    return nil
-end
-
--- 判断对象是否属于本地玩家自己 (避免简化自己手持武器的特效)
-local function IsLocalPlayerOwned(obj)
-    local p = obj
-    local depth = 0
-    while p and depth < 50 do  -- 深度限制防死循环
-        depth = depth + 1
-        if p == LocalPlayer then return true end
-        local parent = safeGet(p, "Parent")
-        p = parent
+    -- 安全读取 Instance 属性 (失败返回 nil)
+    local function safeGet(obj, prop)
+        local ok, v = pcall(function() return obj[prop] end)
+        if ok then return v end
+        return nil
     end
-    return false
-end
 
--- 保存原值 (仅第一次)
-local function FXSave(obj, prop, newVal)
-    if not FX.Originals[obj] then FX.Originals[obj] = {} end
-    if FX.Originals[obj][prop] == nil then
-        local ok, cur = pcall(function() return obj[prop] end)
-        if ok then FX.Originals[obj][prop] = cur end
-    end
-    pcall(function() obj[prop] = newVal end)
-end
-
--- 处理单个特效对象 (内部实现, 由 FXProcess 用 pcall 包裹调用)
--- 严格使用 safeGet 读取属性, 避免访问已失效对象抛错
-local function FXProcessInner(obj)
-    -- 用 pcall 检查有效性 (访问 .Parent 在已 Destroy 对象上会抛错)
-    local alive = false
-    pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
-    if not alive then return end
-    if FX.Originals[obj] then return end  -- 已处理过
-    if IsLocalPlayerOwned(obj) then return end  -- 跳过本地玩家自身
-
-    local cls = safeGet(obj, "ClassName")
-    if not cls then return end
-
-    if Config.FXSimplifyParticles and cls == "ParticleEmitter" then
-        -- Rate: number 类型
-        local origRate = safeGet(obj, "Rate")
-        if type(origRate) == "number" and origRate > 1 then
-            FXSave(obj, "Rate", math.max(0, math.floor(origRate * Config.FXParticleRate)))
+    -- 判断对象是否属于本地玩家自己 (避免简化自己手持武器的特效)
+    local function IsLocalPlayerOwned(obj)
+        local p = obj
+        local depth = 0
+        while p and depth < 50 do  -- 深度限制防死循环
+            depth = depth + 1
+            if p == LocalPlayer then return true end
+            p = safeGet(p, "Parent")
         end
-        -- Lifetime: NumberRange 类型 (注意: 不是 NumberSequence!)
-        local lifetime = safeGet(obj, "Lifetime")
-        if lifetime and type(lifetime) == "table" then
-            local mn, mx = lifetime.Min, lifetime.Max
-            if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
-                FXSave(obj, "Lifetime", NumberRange.new(mn * 0.7, mx * 0.7))
+        return false
+    end
+
+    -- 保存原值 (仅第一次)
+    local function FXSave(obj, prop, newVal)
+        if not FX.Originals[obj] then FX.Originals[obj] = {} end
+        if FX.Originals[obj][prop] == nil then
+            local ok, cur = pcall(function() return obj[prop] end)
+            if ok then FX.Originals[obj][prop] = cur end
+        end
+        pcall(function() obj[prop] = newVal end)
+    end
+
+    -- 处理单个特效对象 (内部实现, 由 FXProcess 用 pcall 包裹调用)
+    local function FXProcessInner(obj)
+        local alive = false
+        pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+        if not alive then return end
+        if FX.Originals[obj] then return end
+        if IsLocalPlayerOwned(obj) then return end
+
+        local cls = safeGet(obj, "ClassName")
+        if not cls then return end
+
+        if Config.FXSimplifyParticles and cls == "ParticleEmitter" then
+            local origRate = safeGet(obj, "Rate")
+            if type(origRate) == "number" and origRate > 1 then
+                FXSave(obj, "Rate", math.max(0, math.floor(origRate * Config.FXParticleRate)))
             end
-        end
-        -- Speed: NumberRange 类型
-        local speed = safeGet(obj, "Speed")
-        if speed and type(speed) == "table" then
-            local mn, mx = speed.Min, speed.Max
-            if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
-                FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
+            local lifetime = safeGet(obj, "Lifetime")
+            if lifetime and type(lifetime) == "table" then
+                local mn, mx = lifetime.Min, lifetime.Max
+                if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
+                    FXSave(obj, "Lifetime", NumberRange.new(mn * 0.7, mx * 0.7))
+                end
             end
+            local speed = safeGet(obj, "Speed")
+            if speed and type(speed) == "table" then
+                local mn, mx = speed.Min, speed.Max
+                if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
+                    FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
+                end
+            end
+            FX.StatsCount = FX.StatsCount + 1
+        elseif Config.FXSimplifyBeams and cls == "Beam" then
+            local t = Config.FXBeamTransparency
+            if type(t) == "number" and t >= 0 and t <= 1 then
+                FXSave(obj, "Transparency", NumberSequence.new(t))
+            end
+            local w0 = safeGet(obj, "Width0")
+            if type(w0) == "number" and w0 > 0.1 then
+                FXSave(obj, "Width0", w0 * 0.5)
+            end
+            local w1 = safeGet(obj, "Width1")
+            if type(w1) == "number" and w1 > 0.1 then
+                FXSave(obj, "Width1", w1 * 0.5)
+            end
+            FX.StatsCount = FX.StatsCount + 1
+        elseif Config.FXSimplifyTrails and cls == "Trail" then
+            local t = Config.FXTrailTransparency
+            if type(t) == "number" and t >= 0 and t <= 1 then
+                FXSave(obj, "Transparency", NumberSequence.new(t))
+            end
+            local lt = safeGet(obj, "Lifetime")
+            if type(lt) == "number" and lt > 0.2 then
+                FXSave(obj, "Lifetime", lt * 0.6)
+            end
+            FX.StatsCount = FX.StatsCount + 1
+        elseif Config.FXSimplifyDecals and (cls == "Decal" or cls == "Texture") then
+            local t = Config.FXDecalTransparency
+            if type(t) == "number" and t >= 0 and t <= 1 then
+                FXSave(obj, "Transparency", t)
+            end
+            FX.StatsCount = FX.StatsCount + 1
+        elseif Config.FXSimplifySmoke and (cls == "Smoke" or cls == "Fire" or cls == "Sparkles") then
+            if cls == "Smoke" then
+                FXSave(obj, "Opacity", 0.1)
+                local sz = safeGet(obj, "Size")
+                if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
+            elseif cls == "Fire" then
+                local heat = safeGet(obj, "Heat")
+                if type(heat) == "number" then FXSave(obj, "Heat", math.max(0, heat * 0.2)) end
+                local sz = safeGet(obj, "Size")
+                if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
+            elseif cls == "Sparkles" then
+                FXSave(obj, "Enabled", false)
+            end
+            FX.StatsCount = FX.StatsCount + 1
         end
-        FX.StatsCount = FX.StatsCount + 1
-    elseif Config.FXSimplifyBeams and cls == "Beam" then
-        -- Transparency: NumberSequence 类型
-        local t = Config.FXBeamTransparency
-        if type(t) == "number" and t >= 0 and t <= 1 then
-            FXSave(obj, "Transparency", NumberSequence.new(t))
-        end
-        local w0 = safeGet(obj, "Width0")
-        if type(w0) == "number" and w0 > 0.1 then
-            FXSave(obj, "Width0", w0 * 0.5)
-        end
-        local w1 = safeGet(obj, "Width1")
-        if type(w1) == "number" and w1 > 0.1 then
-            FXSave(obj, "Width1", w1 * 0.5)
-        end
-        FX.StatsCount = FX.StatsCount + 1
-    elseif Config.FXSimplifyTrails and cls == "Trail" then
-        -- Transparency: NumberSequence 类型
-        local t = Config.FXTrailTransparency
-        if type(t) == "number" and t >= 0 and t <= 1 then
-            FXSave(obj, "Transparency", NumberSequence.new(t))
-        end
-        -- Lifetime: number 类型 (Trail 的 Lifetime 是 number, 不是 NumberRange)
-        local lt = safeGet(obj, "Lifetime")
-        if type(lt) == "number" and lt > 0.2 then
-            FXSave(obj, "Lifetime", lt * 0.6)
-        end
-        FX.StatsCount = FX.StatsCount + 1
-    elseif Config.FXSimplifyDecals and (cls == "Decal" or cls == "Texture") then
-        -- Transparency: number 类型
-        local t = Config.FXDecalTransparency
-        if type(t) == "number" and t >= 0 and t <= 1 then
-            FXSave(obj, "Transparency", t)
-        end
-        FX.StatsCount = FX.StatsCount + 1
-    elseif Config.FXSimplifySmoke and (cls == "Smoke" or cls == "Fire" or cls == "Sparkles") then
-        -- 烟雾/火焰/火花: 降低大小或不透明度 (移除 Explosion, 它无这些属性且为瞬态)
-        if cls == "Smoke" then
-            FXSave(obj, "Opacity", 0.1)
-            local sz = safeGet(obj, "Size")
-            if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
-        elseif cls == "Fire" then
-            local heat = safeGet(obj, "Heat")
-            if type(heat) == "number" then FXSave(obj, "Heat", math.max(0, heat * 0.2)) end
-            local sz = safeGet(obj, "Size")
-            if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
-        elseif cls == "Sparkles" then
-            -- Sparkles 用 Enabled 控制显示
-            FXSave(obj, "Enabled", false)
-        end
-        FX.StatsCount = FX.StatsCount + 1
     end
-end
 
--- 处理单个特效对象 (pcall 保护, 任何错误都不会中断扫描循环)
-local function FXProcess(obj)
-    pcall(FXProcessInner, obj)
-end
-
--- 收集待处理对象 (按容器分批, 不一次性全扫描)
-local function FXCollectContainers()
-    FX.ProcessQueue = {}
-    -- 主要特效容器: Workspace (玩家武器/特效/烟雾弹等都在此), Lighting (天空/光照特效), ReplicatedStorage (有时缓存特效)
-    local containers = { Workspace, Lighting }
-    for _, c in ipairs(containers) do
-        table.insert(FX.ProcessQueue, c)
+    -- 处理单个特效对象 (pcall 保护)
+    local function FXProcess(obj)
+        pcall(FXProcessInner, obj)
     end
-end
 
--- 慢速分批扫描协程 (用 token 防止多个协程同时运行)
-local FX_MAX_QUEUE = 5000  -- 队列最大长度, 防止爆炸性增长导致扫描永不完
--- 防止 Config.FXBatchSize/FXBatchInterval 为 nil 导致比较/wait 报错
-local function safeBatchSize()
-    local v = Config.FXBatchSize
-    if type(v) ~= "number" or v < 1 then return 2 end
-    return math.floor(v)
-end
-local function safeBatchInterval()
-    local v = Config.FXBatchInterval
-    if type(v) ~= "number" or v <= 0 then return 0.1 end
-    return v
-end
+    local function FXCollectContainers()
+        FX.ProcessQueue = {}
+        local containers = { Workspace, Lighting }
+        for _, c in ipairs(containers) do
+            table.insert(FX.ProcessQueue, c)
+        end
+    end
 
-local function FXScanLoop(myToken)
-    local processedThisFrame = 0
-    while FX.Enabled and FX.LoopToken == myToken do
-        processedThisFrame = 0
-        local batchSize = safeBatchSize()
-        -- 处理队列里的容器, 每帧最多 batchSize 个对象
-        while processedThisFrame < batchSize and #FX.ProcessQueue > 0 do
-            -- 协程被停止则立即退出
-            if not FX.Enabled or FX.LoopToken ~= myToken then return end
-            local container = table.remove(FX.ProcessQueue, 1)
-            -- 容器有效性检查 (pcall 保护, 避免访问失效对象抛错)
-            local valid = false
-            pcall(function() valid = container ~= nil and container.Parent ~= nil end)
-            if valid then
-                local children
-                pcall(function() children = container:GetChildren() end)
-                if children then
-                    for _, child in ipairs(children) do
-                        if not FX.Enabled or FX.LoopToken ~= myToken then return end
-                        -- 读取 ClassName (pcall 保护)
-                        local ok, cls = pcall(function() return child.ClassName end)
-                        if not ok then continue end
-                        if (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
-                                or cls == "Decal" or cls == "Texture" or cls == "Smoke"
-                                or cls == "Fire" or cls == "Sparkles") then
-                            FXProcess(child)
-                            processedThisFrame = processedThisFrame + 1
-                            if processedThisFrame >= batchSize then break end
-                        else
-                            -- 能读到 ClassName 说明是 Instance, 非特效对象加入队列待展开
-                            -- 限制队列长度防止爆炸 (跳过不可能含特效的对象)
-                            if #FX.ProcessQueue < FX_MAX_QUEUE
-                               and cls ~= "Camera" and cls ~= "Terrain"
-                               and cls ~= "Weld" and cls ~= "WeldConstraint"
-                               and cls ~= "Motor6D" and cls ~= "Bone"
-                               and cls ~= "Humanoid" and cls ~= "Animation" then
-                                table.insert(FX.ProcessQueue, child)
+    local FX_MAX_QUEUE = 5000
+    local function safeBatchSize()
+        local v = Config.FXBatchSize
+        if type(v) ~= "number" or v < 1 then return 2 end
+        return math.floor(v)
+    end
+    local function safeBatchInterval()
+        local v = Config.FXBatchInterval
+        if type(v) ~= "number" or v <= 0 then return 0.1 end
+        return v
+    end
+
+    local function FXScanLoop(myToken)
+        local processedThisFrame = 0
+        while FX.Enabled and FX.LoopToken == myToken do
+            processedThisFrame = 0
+            local batchSize = safeBatchSize()
+            while processedThisFrame < batchSize and #FX.ProcessQueue > 0 do
+                if not FX.Enabled or FX.LoopToken ~= myToken then return end
+                local container = table.remove(FX.ProcessQueue, 1)
+                local valid = false
+                pcall(function() valid = container ~= nil and container.Parent ~= nil end)
+                if valid then
+                    local children
+                    pcall(function() children = container:GetChildren() end)
+                    if children then
+                        for _, child in ipairs(children) do
+                            if not FX.Enabled or FX.LoopToken ~= myToken then return end
+                            local ok, cls = pcall(function() return child.ClassName end)
+                            if not ok then continue end
+                            if (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+                                    or cls == "Decal" or cls == "Texture" or cls == "Smoke"
+                                    or cls == "Fire" or cls == "Sparkles") then
+                                FXProcess(child)
+                                processedThisFrame = processedThisFrame + 1
+                                if processedThisFrame >= batchSize then break end
+                            else
+                                if #FX.ProcessQueue < FX_MAX_QUEUE
+                                   and cls ~= "Camera" and cls ~= "Terrain"
+                                   and cls ~= "Weld" and cls ~= "WeldConstraint"
+                                   and cls ~= "Motor6D" and cls ~= "Bone"
+                                   and cls ~= "Humanoid" and cls ~= "Animation" then
+                                    table.insert(FX.ProcessQueue, child)
+                                end
                             end
                         end
                     end
                 end
+                if processedThisFrame >= batchSize then break end
             end
-            -- 防死循环: 如果队列过长且都无新增, 让出
-            if processedThisFrame >= batchSize then break end
-        end
-        task.wait(safeBatchInterval())
-        -- 队列空了重新收集 (捕获新特效, 如新投出的烟雾弹)
-        if #FX.ProcessQueue == 0 and FX.Enabled and FX.LoopToken == myToken then
-            FXCollectContainers()
-            task.wait(2)  -- 每轮扫描间隔2秒, 慢速避免卡顿
+            task.wait(safeBatchInterval())
+            if #FX.ProcessQueue == 0 and FX.Enabled and FX.LoopToken == myToken then
+                FXCollectContainers()
+                task.wait(2)
+            end
         end
     end
-end
 
--- 监听新特效生成 (烟雾弹投出后才出现, 需要动态捕获)
-local function FXSetupListeners()
-    if #FX.PendingChildConn > 0 then return end
-    -- Workspace 新增子对象 (烟雾弹/特效模型等)
-    local conn1 = Workspace.DescendantAdded:Connect(function(obj)
-        if not FX.Enabled then return end
-        if not obj then return end
-        local ok, cls = pcall(function() return obj.ClassName end)
-        if not ok then return end
-        if cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
-           or cls == "Decal" or cls == "Texture" or cls == "Smoke"
-           or cls == "Fire" or cls == "Sparkles" then
-            task.wait(0.2)  -- 等属性初始化
-            if FX.Enabled then FXProcess(obj) end
-        end
-    end)
-    table.insert(FX.PendingChildConn, conn1)
-end
-
-local function FXClearListeners()
-    for _, c in ipairs(FX.PendingChildConn) do pcall(function() c:Disconnect() end) end
-    FX.PendingChildConn = {}
-end
-
--- 启动简化
-local function StartFXSimplify()
-    if FX.Enabled then return end
-    FX.Enabled = true
-    FX.Originals = {}
-    FX.StatsCount = 0
-    FX.LoopToken = FX.LoopToken + 1  -- 新令牌, 旧协程会自动退出
-    local myToken = FX.LoopToken
-    FXCollectContainers()
-    FXSetupListeners()
-    -- 用 pcall 包裹整个协程, 防止任何未预期错误打印红字
-    task.spawn(function()
-        pcall(FXScanLoop, myToken)
-    end)
-end
-
--- 停止并还原所有特效 (全程 pcall 保护, 防止访问已销毁对象抛错)
-local function StopFXSimplify()
-    FX.Enabled = false
-    FX.LoopToken = FX.LoopToken + 1  -- 令牌递增, 让扫描协程立即退出
-    FXClearListeners()
-    FX.ProcessQueue = {}
-    -- 还原原值 (整个循环体用 pcall 保护, 避免访问已 Destroy 的 Instance 抛错)
-    local restored = 0
-    pcall(function()
-        for obj, props in pairs(FX.Originals) do
-            -- 检查对象是否仍有效 (pcall 保护 Parent 访问)
-            local alive = false
-            pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
-            if alive then
-                for prop, val in pairs(props) do
-                    pcall(function() obj[prop] = val end)
-                    restored = restored + 1
-                end
-            end
-        end
-    end)
-    FX.Originals = {}
-    return restored
-end
-
--- 重启简化 (子开关切换后调用, 重新扫描以应用新设置)
--- 全程 pcall 保护, 防止任何错误打印红字
-local function FXRestart()
-    task.spawn(function()
-        pcall(function()
-            if FX.Enabled then
-                StopFXSimplify()
-                task.wait(0.3)
-                if Config.FXSimplify then StartFXSimplify() end
+    local function FXSetupListeners()
+        if #FX.PendingChildConn > 0 then return end
+        local conn1 = Workspace.DescendantAdded:Connect(function(obj)
+            if not FX.Enabled then return end
+            if not obj then return end
+            local ok, cls = pcall(function() return obj.ClassName end)
+            if not ok then return end
+            if cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+               or cls == "Decal" or cls == "Texture" or cls == "Smoke"
+               or cls == "Fire" or cls == "Sparkles" then
+                task.wait(0.2)
+                if FX.Enabled then FXProcess(obj) end
             end
         end)
-    end)
-end
+        table.insert(FX.PendingChildConn, conn1)
+    end
+
+    local function FXClearListeners()
+        for _, c in ipairs(FX.PendingChildConn) do pcall(function() c:Disconnect() end) end
+        FX.PendingChildConn = {}
+    end
+
+    -- 赋值给块外前向声明的 local
+    StartFXSimplify = function()
+        if FX.Enabled then return end
+        FX.Enabled = true
+        FX.Originals = {}
+        FX.StatsCount = 0
+        FX.LoopToken = FX.LoopToken + 1
+        local myToken = FX.LoopToken
+        FXCollectContainers()
+        FXSetupListeners()
+        task.spawn(function()
+            pcall(FXScanLoop, myToken)
+        end)
+    end
+
+    StopFXSimplify = function()
+        FX.Enabled = false
+        FX.LoopToken = FX.LoopToken + 1
+        FXClearListeners()
+        FX.ProcessQueue = {}
+        local restored = 0
+        pcall(function()
+            for obj, props in pairs(FX.Originals) do
+                local alive = false
+                pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+                if alive then
+                    for prop, val in pairs(props) do
+                        pcall(function() obj[prop] = val end)
+                        restored = restored + 1
+                    end
+                end
+            end
+        end)
+        FX.Originals = {}
+        return restored
+    end
+
+    FXRestart = function()
+        task.spawn(function()
+            pcall(function()
+                if FX.Enabled then
+                    StopFXSimplify()
+                    task.wait(0.3)
+                    if Config.FXSimplify then StartFXSimplify() end
+                end
+            end)
+        end)
+    end
+end -- FX 系统块结束
 
 -- ============== 玩家ESP (定时器驱动, 不用Heartbeat) ==============
 local PlayerESP = {
@@ -2692,6 +2665,8 @@ end
 task.wait()
 
 -- ============== 视觉页 ==============
+local GhostToggle  -- 前向声明 (UpdateGhostToggleUI 后面需要引用)
+do
 local VisPage = AddNav("视觉", "visual")
 MakeLabel(VisPage, "== 玩家透视 ==")
 MakeToggle(VisPage, "透视玩家 (ESP)", false, function(v)
@@ -2744,6 +2719,7 @@ MakeToggle(VisPage, "详细模式 (触发器+伤害区)", false, function(v)
 end)
 
 MakeLabel(VisPage, "== 墙体透视模式 ==")
+do
 local SpeedModeRow = Instance.new("Frame")
 SpeedModeRow.Size = UDim2.new(1, 0, 0, 38)
 SpeedModeRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
@@ -2764,6 +2740,7 @@ smBtn.MouseButton1Click:Connect(function()
     smLbl.Text = "透视速度: " .. (Config.WallSpeedMode == "fast" and "快速" or "慢速")
     ShowNotification("墙体透视", "已切换为" .. (Config.WallSpeedMode == "fast" and "快速" or "慢速") .. "模式", Color3.fromRGB(255, 200, 80))
 end)
+end -- SpeedModeRow/smLbl/smBtn 释放
 
 MakeSlider(VisPage, "墙体透视范围", 10, 1000, 200, 1, function(v) Config.WallRange = v end)
 MakeSlider(VisPage, "墙体透明度", 0, 1, 0.7, 0.1, function(v) Config.WallTrans = v end, function() if Config.WallXray then RestoreWallXray(); ApplyWallXray() end end)
@@ -2797,7 +2774,7 @@ MakeButton(VisPage, "一键白天", function()
 end)
 
 MakeLabel(VisPage, "== 幽灵模式 ==")
-local GhostToggle = MakeToggle(VisPage, "幽灵模式 (相机自由飞行, 人物冻结)", false, function(v)
+GhostToggle = MakeToggle(VisPage, "幽灵模式 (相机自由飞行, 人物冻结)", false, function(v)
     Config.GhostMode = v; ApplyGhostMode()
 end)
 MakeSlider(VisPage, "幽灵飞行速度 (10~200)", 10, 200, 50, 0.1, function(v) Config.GhostSpeed = v end)
@@ -2808,6 +2785,7 @@ MakeToggle(VisPage, "启用幽灵快捷键", false, function(v)
     ShowNotification("幽灵快捷键", v and "已启用 (按 " .. Config.GhostShortcutKey .. " 切换)" or "已禁用", Color3.fromRGB(180, 80, 255))
 end)
 
+do
 local ShortcutRow = Instance.new("Frame")
 ShortcutRow.Size = UDim2.new(1, 0, 0, 38)
 ShortcutRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
@@ -2842,6 +2820,7 @@ scBtn.MouseButton1Click:Connect(function()
         end
     end)
 end)
+end -- ShortcutRow/scLbl/scBtn 释放
 
 MakeToggle(VisPage, "幽灵状态栏 (右上角)", true, function(v)
     Config.GhostStatusBar = v
@@ -2866,8 +2845,10 @@ MakeButton(VisPage, "立即刷新一次", function()
     ClearAllPlayerESP(); task.wait(0.1); RefreshESP()
     ShowNotification("刷新", "已手动刷新透视对象", Color3.fromRGB(100, 180, 220))
 end)
+end -- VisPage 释放
 
 -- ============== NPC功能页 ==============
+do
 local NPCPage = AddNav("NPC功能", "npc")
 
 MakeLabel(NPCPage, "== NPC 透视 ==")
@@ -2906,6 +2887,7 @@ MakeToggle(NPCPage, "NPC透视 (慢速逐个透视所有NPC)", false, function(v
 end)
 
 -- NPC颜色选择
+do
 local NPCColorRow = Instance.new("Frame")
 NPCColorRow.Size = UDim2.new(1, 0, 0, 38)
 NPCColorRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
@@ -2936,6 +2918,7 @@ for i, cn in ipairs(colorNames) do
         ShowNotification("NPC颜色", "已切换为 " .. cn[2] .. "色", colorValues[cn[1]])
     end)
 end end
+end -- NPCColorRow/ncLbl 释放
 
 MakeLabel(NPCPage, "== NPC 显示选项 ==")
 MakeToggle(NPCPage, "显示NPC名称 (中文翻译)", true, function(v)
@@ -2960,8 +2943,10 @@ MakeToggle(NPCPage, "NPC击杀 (范围内自动击杀)", false, function(v)
     ShowNotification("NPC击杀", v and "已开启 - 范围内NPC自动击杀" or "已关闭", v and Color3.fromRGB(255,80,80) or Color3.fromRGB(180,180,180))
 end)
 MakeSlider(NPCPage, "击杀范围 (1~200)", 1, 200, 50, 1, function(v) Config.NPCKillRange = v end)
+end -- NPCPage 释放
 
 -- ============== 移动页 ==============
+do
 local MovePage = AddNav("移动", "move")
 MakeLabel(MovePage, "== 移动速度 ==")
 MakeToggle(MovePage, "修改移动速度", false, function(v) Config.SpeedEnabled = v; ApplySpeed(); ShowNotification("移动速度", v and "已开启" or "已关闭", v and Color3.fromRGB(100,180,220) or Color3.fromRGB(180,180,180)) end)
@@ -2992,8 +2977,10 @@ MakeToggle(MovePage, "悬浮模式 (WASD移动 Q下降E上升)", false, function
     Config.FloatMode = v; ApplyFloat()
 end)
 MakeSlider(MovePage, "悬浮速度 (1~100)", 1, 100, 30, 0.1, function(v) Config.FloatSpeed = v end)
+end -- MovePage 释放
 
 -- ============== 互动页 ==============
+do
 local InterPage = AddNav("互动", "interact")
 MakeLabel(InterPage, "== 智能快速互动 ==")
 MakeToggle(InterPage, "快速互动 (自动检测类型并加速)", false, function(v)
@@ -3042,6 +3029,7 @@ MakeButton(InterPage, "刷新互动对象", function()
     ApplyFastInteract(); ClearInteractESP(); ApplyInteractESP()
     ShowNotification("互动", "已刷新互动对象", Color3.fromRGB(100, 220, 180))
 end)
+end -- InterPage 释放
 
 -- ============== 枪械检测/修改窗口 + 颜色选择器 + 外出UI ==============
 -- 前向声明 Weapon 和 DetectWeapon (实际定义在后面, 但这些函数需要引用同一个upvalue)
@@ -3828,6 +3816,7 @@ end)
 end
 
 -- ============== 格斗适用页 ==============
+do
 local CmbPage = AddNav("格斗适用", "combat")
 MakeLabel(CmbPage, "== 格斗总开关 ==")
 MakeToggle(CmbPage, "格斗功能总开关", false, function(v)
@@ -3883,6 +3872,7 @@ MakeSlider(CmbPage, "预判百分比 (0~100, 100=完美)", 0, 100, 80, 1, functi
 MakeSlider(CmbPage, "子弹速度 (50~2000, 远程武器预判用)", 50, 2000, 500, 10, function(v) Config.CombatBulletSpeed = v end)
 MakeLabel(CmbPage, "== 锁定目标 ==")
 -- 锁定模式切换按钮 (前向声明+单独Connect, 避免自引用问题)
+do
 local lockModeBtn = Instance.new("TextButton")
 lockModeBtn.Size = UDim2.new(1, 0, 0, 36)
 lockModeBtn.BackgroundColor3 = Color3.fromRGB(60, 90, 160)
@@ -3921,6 +3911,7 @@ lockPartBtn.MouseButton1Click:Connect(function()
         ShowNotification("锁定部位", "已切换为: " .. newName, Color3.fromRGB(100,220,180))
     end)
 end)
+end -- lockModeBtn/lockPartBtn 释放
 MakeLabel(CmbPage, "== 锁定显示 ==")
 MakeButton(CmbPage, "调节锁定方框颜色", function()
     OpenColorPicker()
@@ -3931,8 +3922,10 @@ MakeToggle(CmbPage, "开启外出UI (小型同步UI)", false, function(v)
     if v then OpenCombatMiniUI() else CloseCombatMiniUI() end
     ShowNotification("外出UI", v and "已开启" or "已关闭", v and Color3.fromRGB(180,80,255) or Color3.fromRGB(180,180,180))
 end)
+end -- CmbPage 释放
 
 -- ============== 优化页 (服务器特效简化) ==============
+do
 local OptPage = AddNav("优化", "optimize")
 MakeLabel(OptPage, "== 服务器特效简化 ==")
 MakeLabel(OptPage, "说明: 保留特效但大幅降低渲染负担, 慢速分批处理防闪退")
@@ -3991,8 +3984,10 @@ end)
 MakeSlider(OptPage, "每帧间隔 (秒, 越大越慢)", 0.05, 0.5, 0.1, 0.05, function(v)
     Config.FXBatchInterval = v
 end)
+end -- OptPage 释放
 
 -- ============== 设置页 ==============
+do
 local SetPage = AddNav("设置", "settings")
 MakeLabel(SetPage, "== 通知系统 ==")
 MakeToggle(SetPage, "全部通知 (总开关)", true, function(v)
@@ -4001,6 +3996,7 @@ MakeToggle(SetPage, "全部通知 (总开关)", true, function(v)
 end)
 
 MakeLabel(SetPage, "== 通知模式 ==")
+do
 local NotifyModeRow = Instance.new("Frame")
 NotifyModeRow.Size = UDim2.new(1, 0, 0, 38)
 NotifyModeRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
@@ -4025,6 +4021,7 @@ nmBtn.MouseButton1Click:Connect(function()
     nmLbl.Text = "通知模式: " .. nmOptions[nmIdx][2]
     ShowNotification("通知", "已切换为" .. nmOptions[nmIdx][2] .. "模式", Color3.fromRGB(200, 200, 200))
 end)
+end -- NotifyModeRow/nmLbl/nmBtn/nmOptions/nmIdx 释放
 
 MakeLabel(SetPage, "== UI 大小 ==")
 MakeButton(SetPage, "调节 UI 大小 (点击打开)", function()
@@ -4190,6 +4187,7 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         pcall(function() if Ghost.StatusGui then Ghost.StatusGui:Destroy() end end)
     end)
 end)
+end -- SetPage 释放
 
 -- 更新日志页
 do
