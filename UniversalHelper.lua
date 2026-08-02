@@ -343,10 +343,13 @@ local FX = {
 -- 判断对象是否属于本地玩家自己 (避免简化自己手持武器的特效)
 local function IsLocalPlayerOwned(obj)
     local p = obj
-    while p and p ~= game do
+    while p do
         if p == LocalPlayer then return true end
-        if p:IsA("Player") and p == LocalPlayer then return true end
-        p = p.Parent
+        local ok, isPlr = pcall(function() return p:IsA("Player") end)
+        if ok and isPlr and p == LocalPlayer then return true end
+        local ok2, parent = pcall(function() return p.Parent end)
+        if not ok2 then return false end
+        p = parent
     end
     return false
 end
@@ -361,14 +364,13 @@ local function FXSave(obj, prop, newVal)
     pcall(function() obj[prop] = newVal end)
 end
 
--- 处理单个特效对象
-local function FXProcess(obj)
+-- 处理单个特效对象 (内部实现, 由 FXProcess 用 pcall 包裹调用)
+local function FXProcessInner(obj)
     if not obj or not obj.Parent then return end
     if FX.Originals[obj] then return end  -- 已处理过
     if IsLocalPlayerOwned(obj) then return end  -- 跳过本地玩家自身
 
-    local ok, cls = pcall(function() return obj.ClassName end)
-    if not ok then return end
+    local cls = obj.ClassName
 
     if Config.FXSimplifyParticles and cls == "ParticleEmitter" then
         -- 降低发射率 (Rate), 缩短生命周期, 降低速度
@@ -378,11 +380,15 @@ local function FXProcess(obj)
         end
         if obj.Lifetime then
             local mn, mx = obj.Lifetime.Min, obj.Lifetime.Max
-            FXSave(obj, "Lifetime", NumberSequence.new(mn * 0.7, mx * 0.7))
+            if mn and mx and mn >= 0 and mx >= 0 and mx >= mn then
+                FXSave(obj, "Lifetime", NumberSequence.new(mn * 0.7, mx * 0.7))
+            end
         end
         if obj.Speed then
             local mn, mx = obj.Speed.Min, obj.Speed.Max
-            FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
+            if mn and mx and mn >= 0 and mx >= 0 and mx >= mn then
+                FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
+            end
         end
         FX.StatsCount = FX.StatsCount + 1
     elseif Config.FXSimplifyBeams and cls == "Beam" then
@@ -418,6 +424,11 @@ local function FXProcess(obj)
     end
 end
 
+-- 处理单个特效对象 (pcall 保护, 任何错误都不会中断扫描循环)
+local function FXProcess(obj)
+    pcall(FXProcessInner, obj)
+end
+
 -- 收集待处理对象 (按容器分批, 不一次性全扫描)
 local function FXCollectContainers()
     FX.ProcessQueue = {}
@@ -429,6 +440,7 @@ local function FXCollectContainers()
 end
 
 -- 慢速分批扫描协程
+local FX_MAX_QUEUE = 5000  -- 队列最大长度, 防止爆炸性增长导致扫描永不完
 local function FXScanLoop()
     local processedThisFrame = 0
     while FX.Enabled do
@@ -436,23 +448,32 @@ local function FXScanLoop()
         -- 处理队列里的容器, 每帧最多 Config.FXBatchSize 个对象
         while processedThisFrame < Config.FXBatchSize and #FX.ProcessQueue > 0 do
             local container = table.remove(FX.ProcessQueue, 1)
-            if container and container.Parent then
-                -- 限制单容器直接子级数量, 避免巨型模型一次性展开
+            -- 容器有效性检查 (pcall 保护, 避免访问失效对象的 Parent 抛错)
+            local valid = false
+            pcall(function() valid = container ~= nil and container.Parent ~= nil end)
+            if valid then
                 local children
                 pcall(function() children = container:GetChildren() end)
                 if children then
                     for _, child in ipairs(children) do
-                        -- 直接处理(若是特效对象) 或 加入队列待后续展开
+                        -- 读取 ClassName (pcall 保护)
                         local ok, cls = pcall(function() return child.ClassName end)
-                        if ok and (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+                        if not ok then continue end
+                        if (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
                                 or cls == "Decal" or cls == "Texture" or cls == "Smoke"
                                 or cls == "Fire" or cls == "Sparkles") then
                             FXProcess(child)
                             processedThisFrame = processedThisFrame + 1
                             if processedThisFrame >= Config.FXBatchSize then break end
-                        elseif ok and child:IsA("Instance") then
-                            -- 非特效对象加入队列, 等下轮展开
-                            table.insert(FX.ProcessQueue, child)
+                        else
+                            -- 能读到 ClassName 说明是 Instance, 非特效对象加入队列待展开
+                            -- 限制队列长度防止爆炸 (跳过 Camera/Terrain/Weld 等不可能含特效的对象)
+                            if #FX.ProcessQueue < FX_MAX_QUEUE
+                               and cls ~= "Camera" and cls ~= "Terrain"
+                               and cls ~= "Weld" and cls ~= "WeldConstraint"
+                               and cls ~= "Motor6D" and cls ~= "Bone" then
+                                table.insert(FX.ProcessQueue, child)
+                            end
                         end
                     end
                 end
