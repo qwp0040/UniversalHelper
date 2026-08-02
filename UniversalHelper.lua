@@ -40,7 +40,10 @@ local Config = {
     AutoInteractRange=30,         -- 自动互动检测范围(stud)
     AutoInteractInterval=0.5,     -- 自动互动触发间隔(秒)
     AutoInteractTarget="",        -- 选中的目标互动名称(空=全部)
-    AutoInteractIgnoreDist=true,  -- 不受距离限制(全图触发)
+    AutoInteractIgnoreDist=false, -- 不受距离限制(全图触发) 默认关闭=只互动周围
+    AutoDetectInteract=true,      -- 自动检测可互动对象(持续扫描填充列表, 无需手动点)
+    AutoInteractSingleMode=false, -- 单选模式(仅互动选中的目标名称)
+    AutoInteractKey=Enum.KeyCode.E, -- 自动互动按键(默认E, 可自定义)
     -- 自动修改(刷新互动增强)
     AutoModify=false,             -- 自动修改总开关(开启后慢速扫描+循环修改)
     AutoModifyMode=1,             -- 1=全部重复修改 2=单次修改模式
@@ -1851,9 +1854,10 @@ local function ApplyFloat()
         local hrp = GetHRP()
         if hum then
             SavedFloatState = hum:GetState()
-            hum.PlatformStand = true  -- 保持站立姿态, 不被重力拉倒 (避免Physics导致的不动)
+            hum.PlatformStand = true  -- 关闭人形自平衡, 让我们直接控制速度
             hum.AutoRotate = false
-            -- 锁定关节角速度, 防止翻转失控
+        end
+        if hrp then
             hrp.AssemblyAngularVelocity = Vector3.zero
         end
         Saved.FloatConn = RunService.Heartbeat:Connect(function()
@@ -1861,33 +1865,33 @@ local function ApplyFloat()
             local hrp = GetHRP()
             local hum = GetHum()
             if not hrp or not hum then return end
-            -- 强制锁定旋转, 防止翻转失控 (只保留Y轴朝向, 永远面朝前方)
-            local currentVel = hrp.AssemblyAngularVelocity
-            if currentVel.Magnitude > 0.1 then
+            -- 持续清零角速度, 防止翻转失控 (不再用 CFrame 强制锁定, 避免与物理引擎打架导致卡顿/不动)
+            local av = hrp.AssemblyAngularVelocity
+            if av.Magnitude > 0.05 then
                 hrp.AssemblyAngularVelocity = Vector3.zero
             end
-            -- 锁定俯仰/翻滚角度, 只保留Y轴旋转
-            local rot = hrp.Rotation
-            local lookX, lookZ = rot.LookVector.X, rot.LookVector.Z
-            local yRot = math.atan2(-lookX, -lookZ)
-            hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, yRot, 0)
+            -- 相机方向移动
             local cam = Camera.CFrame
+            local fwd = Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z)
+            local right = Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z)
+            if fwd.Magnitude > 0 then fwd = fwd.Unit end
+            if right.Magnitude > 0 then right = right.Unit end
             local moveDir = Vector3.zero
-            if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir += Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z).Unit end
-            if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir -= Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z).Unit end
-            if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir -= Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z).Unit end
-            if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir += Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z).Unit end
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir += fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir -= fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir -= right end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir += right end
             local yVel = 0
-            if UserInputService:IsKeyDown(Enum.KeyCode.Q) then yVel = -Config.FloatSpeed
-            elseif UserInputService:IsKeyDown(Enum.KeyCode.E) then yVel = Config.FloatSpeed end
+            if UserInputService:IsKeyDown(Enum.KeyCode.E) then yVel = Config.FloatSpeed
+            elseif UserInputService:IsKeyDown(Enum.KeyCode.Q) then yVel = -Config.FloatSpeed end
             if moveDir.Magnitude > 0 then
                 moveDir = moveDir.Unit
                 hrp.AssemblyLinearVelocity = Vector3.new(moveDir.X * Config.FloatSpeed, yVel, moveDir.Z * Config.FloatSpeed)
             else
                 local cv = hrp.AssemblyLinearVelocity
                 if yVel == 0 then
-                    -- 悬停: Y速度归零, 水平阻尼, 不再慢慢下落
-                    hrp.AssemblyLinearVelocity = Vector3.new(cv.X * 0.8, 0, cv.Z * 0.8)
+                    -- 悬停: Y速度归零, 水平阻尼, 不下落
+                    hrp.AssemblyLinearVelocity = Vector3.new(cv.X * 0.82, 0, cv.Z * 0.82)
                 else
                     hrp.AssemblyLinearVelocity = Vector3.new(cv.X * 0.9, yVel, cv.Z * 0.9)
                 end
@@ -2706,15 +2710,22 @@ end
 -- ============== 自动互动系统 + 自动修改系统 ==============
 -- do-end 块隔离 local 寄存器, 性能化设计: 慢速分批扫描, yield 防卡
 local StartAutoInteract, StopAutoInteract, RefreshInteractNames, GetInteractNames
+local StartAutoDetect, StopAutoDetect
 local StartAutoModify, StopAutoModify
 do
     local AI = {
         Enabled = false,
-        LoopToken = 0,
+        LoopToken = 0,     -- 触发循环的取消令牌
+        ScanToken = 0,     -- 扫描任务的取消令牌 (与触发循环解耦, 可独立扫描)
         NamesCount = {},   -- name -> 出现次数 (用于"频繁出现"统计)
         NamesList = {},    -- 去重后的名称列表 (用于UI选择)
-        ScanQueue = {},    -- 待扫描队列
+        PromptsList = {},  -- 扫描到的互动对象实例列表 (供触发循环使用)
+        ScanQueue = {},
         LastScanTime = 0,
+    }
+    local AD = {
+        Enabled = false,
+        LoopToken = 0,
     }
     local AM = {
         Enabled = false,
@@ -2730,33 +2741,55 @@ do
         return nil
     end
 
-    -- 获取互动对象的"中文名称" (ActionText 优先, 没有则 ObjectText, 都没有则用父对象名)
+    -- 获取互动对象的"中文名称" (按类型取最合适的文本)
     local function GetInteractName(prompt)
-        local actionText = safeGet(prompt, "ActionText")
-        if type(actionText) == "string" and #actionText > 0 then return actionText end
-        local objectText = safeGet(prompt, "ObjectText")
-        if type(objectText) == "string" and #objectText > 0 then return objectText end
+        local cls
+        pcall(function() cls = prompt.ClassName end)
+        if cls == "ProximityPrompt" then
+            local actionText = safeGet(prompt, "ActionText")
+            if type(actionText) == "string" and #actionText > 0 then return actionText end
+            local objectText = safeGet(prompt, "ObjectText")
+            if type(objectText) == "string" and #objectText > 0 then return objectText end
+        elseif cls == "TextButton" or cls == "ImageButton" then
+            local txt = safeGet(prompt, "Text")
+            if type(txt) == "string" and #txt > 0 then return txt end
+        end
+        -- 通用: 优先用父对象名 (ProximityPrompt/ClickDetector 通常挂在道具上)
         local parent = safeGet(prompt, "Parent")
         if parent then
             local pn = safeGet(parent, "Name")
             if type(pn) == "string" and #pn > 0 then return pn end
         end
+        local ownName = safeGet(prompt, "Name")
+        if type(ownName) == "string" and #ownName > 0 then return ownName end
         return "未命名互动"
     end
 
-    -- 判断是否为可触发互动对象
+    -- 判断是否为可触发互动对象 (扩展检测: 道具/座椅/世界UI按钮等, 防止漏检)
     local function IsInteractable(obj)
         local ok, cls = pcall(function() return obj.ClassName end)
         if not ok then return false end
-        return cls == "ProximityPrompt" or cls == "ClickDetector"
+        if cls == "ProximityPrompt" or cls == "ClickDetector" then return true end
+        if cls == "Seat" or cls == "VehicleSeat" then return true end
+        if cls == "Tool" then return true end
+        -- 世界中的可点击UI按钮 (BillboardGui/SurfaceGui 内的 TextButton/ImageButton)
+        if cls == "TextButton" or cls == "ImageButton" then
+            local parent = safeGet(obj, "Parent")
+            if parent then
+                local pcls
+                pcall(function() pcls = parent.ClassName end)
+                if pcls == "BillboardGui" or pcls == "SurfaceGui" then return true end
+            end
+        end
+        return false
     end
 
-    -- 触发单个互动对象 (ProximityPrompt 用 Trigger, ClickDetector 模拟点击)
-    local function TriggerInteract(prompt)
+    -- 触发单个互动对象 (按类型分别处理; useKey 用于部分游戏的按键模拟)
+    local function TriggerInteract(prompt, useKey)
+        useKey = useKey or Config.AutoInteractKey or Enum.KeyCode.E
         local ok, cls = pcall(function() return prompt.ClassName end)
         if not ok then return false end
         if cls == "ProximityPrompt" then
-            -- ProximityPrompt: 调用 Trigger (需要 LocalPlayer 但 fireproximityprompt 更稳)
             local triggered = false
             pcall(function()
                 if fireproximityprompt then
@@ -2765,7 +2798,6 @@ do
                 end
             end)
             if not triggered then
-                -- 备用: 直接调用内部触发 (部分环境不支持)
                 pcall(function()
                     prompt:InputHoldBegin()
                     task.wait(0.05)
@@ -2775,13 +2807,11 @@ do
             end
             return triggered
         elseif cls == "ClickDetector" then
-            -- ClickDetector: 模拟鼠标点击
             pcall(function()
                 local parent = prompt.Parent
                 if parent and LocalPlayer.Character then
                     local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if root then
-                        -- 模拟点击事件 (部分游戏会在服务端校验, 这里尽力而为)
                         for _, conn in ipairs(getconnections(prompt.MouseClick) or {}) do
                             pcall(function() conn:Fire(root) end)
                         end
@@ -2789,20 +2819,57 @@ do
                 end
             end)
             return true
+        elseif cls == "Seat" or cls == "VehicleSeat" then
+            pcall(function()
+                local hum = GetHum()
+                if hum and prompt.Occupant == nil then
+                    prompt:Sit(hum)
+                end
+            end)
+            return true
+        elseif cls == "Tool" then
+            pcall(function()
+                local char = LocalPlayer.Character
+                local parent = prompt.Parent
+                if char and parent and not parent:IsDescendantOf(char) then
+                    prompt.Parent = char  -- 尝试装备 (部分游戏会过滤, 尽力而为)
+                end
+            end)
+            return true
+        elseif cls == "TextButton" or cls == "ImageButton" then
+            pcall(function()
+                for _, conn in ipairs(getconnections(prompt.MouseButton1Click) or {}) do
+                    pcall(function() conn:Fire() end)
+                end
+                for _, conn in ipairs(getconnections(prompt.Activated) or {}) do
+                    pcall(function() conn:Fire() end)
+                end
+            end)
+            return true
         end
+        -- 兜底: 模拟按键 (针对用自定义按键检测互动的游戏, 执行器无此函数则静默跳过)
+        pcall(function()
+            if keypress then
+                keypress(useKey)
+                task.wait(0.05)
+                if keyrelease then keyrelease(useKey) end
+            end
+        end)
         return false
     end
 
-    -- 扫描收集所有互动对象的名称 (慢速, 分批 yield)
-    local function ScanInteractNames(myToken)
+    -- 扫描收集所有互动对象的名称 + 实例 (慢速, 分批 yield)
+    -- 注意: 使用 AI.ScanToken (与触发循环解耦), 允许自动检测独立扫描
+    local function ScanInteractNames(scanToken)
         AI.NamesCount = {}
         AI.NamesList = {}
+        AI.PromptsList = {}
         AI.ScanQueue = { Workspace }
         local scanned = 0
         local childrenIterated = 0
 
         while #AI.ScanQueue > 0 do
-            if AI.LoopToken ~= myToken then return end
+            if AI.ScanToken ~= scanToken then return end
             local container = table.remove(AI.ScanQueue, 1)
             local valid = false
             pcall(function() valid = container ~= nil and container.Parent ~= nil end)
@@ -2811,16 +2878,13 @@ do
                 pcall(function() children = container:GetChildren() end)
                 if children then
                     for _, child in ipairs(children) do
-                        if AI.LoopToken ~= myToken then return end
+                        if AI.ScanToken ~= scanToken then return end
                         childrenIterated = childrenIterated + 1
                         if childrenIterated >= 30 then
                             childrenIterated = 0
                             task.wait(0.15)
                         end
-                        local ok, cls = pcall(function() return child.ClassName end)
-                        if not ok then
-                            -- 跳过
-                        elseif cls == "ProximityPrompt" or cls == "ClickDetector" then
+                        if IsInteractable(child) then
                             local name = GetInteractName(child)
                             if not AI.NamesCount[name] then
                                 AI.NamesCount[name] = 1
@@ -2828,15 +2892,17 @@ do
                             else
                                 AI.NamesCount[name] = AI.NamesCount[name] + 1
                             end
+                            table.insert(AI.PromptsList, child)
                             scanned = scanned + 1
-                            -- 硬性上限
-                            if scanned >= 500 then return end
+                            if scanned >= 600 then return end
                         else
-                            -- 递归 (限制队列大小)
-                            if cls ~= "Camera" and cls ~= "Terrain" and cls ~= "Humanoid"
-                               and cls ~= "Script" and cls ~= "LocalScript" and cls ~= "ModuleScript"
-                               and cls ~= "Sound" and cls ~= "Weld" and cls ~= "WeldConstraint"
-                               and cls ~= "Motor6D" and cls ~= "Bone" and cls ~= "Animation"
+                            -- 递归 (限制队列大小, 跳过无关类型)
+                            local ccls
+                            pcall(function() ccls = child.ClassName end)
+                            if ccls and ccls ~= "Camera" and ccls ~= "Terrain" and ccls ~= "Humanoid"
+                               and ccls ~= "Script" and ccls ~= "LocalScript" and ccls ~= "ModuleScript"
+                               and ccls ~= "Sound" and ccls ~= "Weld" and ccls ~= "WeldConstraint"
+                               and ccls ~= "Motor6D" and ccls ~= "Bone" and ccls ~= "Animation"
                                and #AI.ScanQueue < 3000 then
                                 table.insert(AI.ScanQueue, child)
                             end
@@ -2847,12 +2913,12 @@ do
         end
     end
 
-    -- 对外: 刷新名称列表 (慢速, 异步)
+    -- 对外: 刷新名称列表 (慢速, 异步, 不影响触发循环)
     RefreshInteractNames = function()
-        AI.LoopToken = AI.LoopToken + 1
-        local myToken = AI.LoopToken
+        AI.ScanToken = AI.ScanToken + 1
+        local scanToken = AI.ScanToken
         task.spawn(function()
-            pcall(ScanInteractNames, myToken)
+            pcall(ScanInteractNames, scanToken)
         end)
     end
 
@@ -2862,12 +2928,11 @@ do
         for _, name in ipairs(AI.NamesList) do
             table.insert(result, {name = name, count = AI.NamesCount[name] or 1})
         end
-        -- 按出现次数降序
         table.sort(result, function(a, b) return a.count > b.count end)
         return result
     end
 
-    -- 自动互动主循环: 每隔 interval 扫描范围内匹配名称的互动对象并触发
+    -- 自动互动主循环: 每隔 interval 遍历已扫描的互动对象, 匹配名称后触发
     local function AutoInteractLoop(myToken)
         while AI.Enabled and AI.LoopToken == myToken do
             local interval = Config.AutoInteractInterval
@@ -2875,86 +2940,69 @@ do
             local range = Config.AutoInteractRange
             if type(range) ~= "number" or range < 1 then range = 30 end
             local target = Config.AutoInteractTarget or ""
+            local singleMode = Config.AutoInteractSingleMode == true
+            local autoDetect = Config.AutoDetectInteract == true
             local ignoreDist = Config.AutoInteractIgnoreDist == true
+            local useKey = Config.AutoInteractKey or Enum.KeyCode.E
 
-            -- 获取玩家位置
-            local rootPos = nil
-            pcall(function()
-                if LocalPlayer.Character then
-                    local r = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-                    if r then rootPos = r.Position end
-                end
-            end)
+            -- 默认模式: 未开单选 + 未开自动检测 + 未选目标 -> 自动互动周围(强制受距离限制)
+            local isDefaultMode = (target == "" and not singleMode and not autoDetect)
+            local effectiveIgnoreDist = ignoreDist and not isDefaultMode
 
-            -- 遍历已缓存的 Prompts (复用 Interact.PromptsCache, 性能化)
-            local triggeredCount = 0
-            local processedThisFrame = 0
-            local promptsToCheck = {}
-
-            -- 收集候选对象 (从 Interact.PromptsCache 或全树扫描)
-            pcall(function()
-                if Interact.PromptsCache and next(Interact.PromptsCache) then
-                    for prompt, _ in pairs(Interact.PromptsCache) do
-                        table.insert(promptsToCheck, prompt)
-                    end
-                end
-            end)
-
-            -- 如果缓存为空, 直接扫描 Workspace 第一层子级的 ProximityPrompt/ClickDetector
-            if #promptsToCheck == 0 then
+            -- 单选模式: 必须有目标名才触发; 默认模式/无目标时互动全部
+            local requireTarget = singleMode
+            if requireTarget and target == "" then
+                task.wait(interval)
+            else
+                -- 玩家位置 (用于距离判断)
+                local rootPos = nil
                 pcall(function()
-                    for _, child in ipairs(Workspace:GetDescendants()) do
-                        if processedThisFrame >= 50 then break end
-                        if IsInteractable(child) then
-                            table.insert(promptsToCheck, child)
-                            processedThisFrame = processedThisFrame + 1
-                        end
+                    if LocalPlayer.Character then
+                        local r = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                        if r then rootPos = r.Position end
                     end
                 end)
-            end
 
-            -- 触发匹配的对象
-            for _, prompt in ipairs(promptsToCheck) do
-                if AI.LoopToken ~= myToken then return end
-                local alive = false
-                pcall(function() alive = prompt ~= nil and prompt.Parent ~= nil end)
-                if alive then
-                    -- 名称匹配
-                    local name = GetInteractName(prompt)
-                    local nameMatch = (target == "") or (name == target)
-                    if nameMatch then
-                        -- 距离检查
-                        local inRange = true
-                        if not ignoreDist and rootPos then
-                            local parent = safeGet(prompt, "Parent")
-                            local partPos = nil
-                            pcall(function()
-                                if parent then
-                                    if parent:IsA("BasePart") then
-                                        partPos = parent.Position
-                                    elseif parent:IsA("Model") then
-                                        local pfp = parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart")
-                                        if pfp then partPos = pfp.Position end
+                -- 遍历已扫描的实例列表 (由 ScanInteractNames 填充)
+                local promptsToCheck = AI.PromptsList or {}
+                for _, prompt in ipairs(promptsToCheck) do
+                    if AI.LoopToken ~= myToken then return end
+                    local alive = false
+                    pcall(function() alive = prompt ~= nil and prompt.Parent ~= nil end)
+                    if alive then
+                        local name = GetInteractName(prompt)
+                        local nameMatch = (target == "") or (name == target)
+                        if nameMatch then
+                            local inRange = true
+                            if not effectiveIgnoreDist and rootPos then
+                                local parent = safeGet(prompt, "Parent")
+                                local partPos = nil
+                                pcall(function()
+                                    if parent then
+                                        if parent:IsA("BasePart") then
+                                            partPos = parent.Position
+                                        elseif parent:IsA("Model") then
+                                            local pfp = parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart")
+                                            if pfp then partPos = pfp.Position end
+                                        elseif parent:IsA("Tool") then
+                                            local h = parent:FindFirstChildWhichIsA("BasePart")
+                                            if h then partPos = h.Position end
+                                        end
                                     end
+                                end)
+                                if partPos then
+                                    inRange = (rootPos - partPos).Magnitude <= range
                                 end
-                            end)
-                            if partPos then
-                                inRange = (rootPos - partPos).Magnitude <= range
                             end
-                        end
-                        if inRange then
-                            if TriggerInteract(prompt) then
-                                triggeredCount = triggeredCount + 1
+                            if inRange then
+                                pcall(TriggerInteract, prompt, useKey)
+                                task.wait(0.05)  -- 每次触发后小yield防卡
                             end
-                            -- 每次触发后小yield防卡
-                            task.wait(0.05)
                         end
                     end
                 end
+                task.wait(interval)
             end
-
-            -- 等待下一轮
-            task.wait(interval)
         end
     end
 
@@ -2963,19 +3011,49 @@ do
         AI.Enabled = true
         AI.LoopToken = AI.LoopToken + 1
         local myToken = AI.LoopToken
-        -- 先慢速扫描一次名称
-        task.spawn(function()
-            pcall(ScanInteractNames, myToken)
-        end)
+        -- 先慢速扫描一次填充名称/实例列表
+        RefreshInteractNames()
         -- 启动触发循环
         task.spawn(function()
             pcall(AutoInteractLoop, myToken)
         end)
+        -- 若自动检测已开启, 同步启动检测循环
+        if Config.AutoDetectInteract and not AD.Enabled then
+            StartAutoDetect()
+        end
     end
 
     StopAutoInteract = function()
         AI.Enabled = false
         AI.LoopToken = AI.LoopToken + 1
+    end
+
+    -- ====== 自动检测 (持续慢速扫描填充列表, 无需手动点) ======
+    StartAutoDetect = function()
+        if AD.Enabled then return end
+        AD.Enabled = true
+        AD.LoopToken = AD.LoopToken + 1
+        local myToken = AD.LoopToken
+        task.spawn(function()
+            -- 立即先扫一次
+            pcall(RefreshInteractNames)
+            while AD.Enabled and AD.LoopToken == myToken do
+                -- 每 5 秒慢速重扫一次 (性能化, 防卡)
+                local waited = 0
+                while waited < 5 and AD.Enabled and AD.LoopToken == myToken do
+                    task.wait(0.5)
+                    waited = waited + 0.5
+                end
+                if AD.Enabled and AD.LoopToken == myToken and Config.AutoDetectInteract then
+                    pcall(RefreshInteractNames)
+                end
+            end
+        end)
+    end
+
+    StopAutoDetect = function()
+        AD.Enabled = false
+        AD.LoopToken = AD.LoopToken + 1
     end
 
     -- ====== 自动修改系统 (刷新互动增强) ======
@@ -3846,134 +3924,193 @@ MakeButton(InterPage, "手动刷新互动对象 (一次性)", function()
 end)
 
 -- ====== 自动互动 (性能化设计, 不卡顿) ======
-MakeLabel(InterPage, "== 自动互动 (按名称自动触发) ==")
-MakeLabel(InterPage, "说明: 检测游戏内可互动东西, 选名称后自动触发, 不受距离限制")
+MakeLabel(InterPage, "== 自动互动 (自动检测 + 自动触发) ==")
+MakeLabel(InterPage, "说明: 默认自动互动周围; 开自动检测持续扫描; 单选模式仅互动选中目标")
 MakeToggle(InterPage, "自动互动 (总开关)", false, function(v)
     Config.AutoInteract = v
     if v then
         StartAutoInteract()
-        ShowNotification("自动互动", "已开启 (慢速扫描中)", Color3.fromRGB(255, 200, 80))
+        ShowNotification("自动互动", "已开启 (默认互动周围)", Color3.fromRGB(255, 200, 80))
     else
         StopAutoInteract()
         ShowNotification("自动互动", "已关闭", Color3.fromRGB(180, 180, 180))
     end
 end)
-MakeButton(InterPage, "刷新互动名称列表 (检测可互动东西)", function()
-    RefreshInteractNames()
-    ShowNotification("自动互动", "正在慢速扫描中, 请稍候3秒后再查看列表", Color3.fromRGB(255, 200, 80))
-    task.delay(3, function()
-        local names = GetInteractNames()
-        if #names == 0 then
-            ShowNotification("自动互动", "未检测到可互动对象", Color3.fromRGB(255, 150, 80))
-        else
-            ShowNotification("自动互动", "检测到 " .. #names .. " 种名称 (详见控制台)", Color3.fromRGB(100, 220, 180))
-            print("[自动互动] 检测到的可互动名称 (按出现次数降序):")
-            for i, item in ipairs(names) do
-                if i > 30 then break end
-                print(string.format("  %d. %s (出现 %d 次)", i, item.name, item.count))
-            end
-        end
-    end)
+MakeToggle(InterPage, "自动检测可互动对象 (持续扫描)", true, function(v)
+    Config.AutoDetectInteract = v
+    if v then
+        StartAutoDetect()
+        ShowNotification("自动检测", "已开启 (慢速扫描填充列表)", Color3.fromRGB(255, 200, 80))
+    else
+        StopAutoDetect()
+        ShowNotification("自动检测", "已关闭", Color3.fromRGB(180, 180, 180))
+    end
 end)
+MakeToggle(InterPage, "单选模式 (仅互动选中目标)", false, function(v)
+    Config.AutoInteractSingleMode = v
+    ShowNotification("单选模式", v and "已开启 (请在下方列表选目标)" or "已关闭 (互动全部匹配)", Color3.fromRGB(255, 200, 80))
+end)
+
+-- 自动互动按键 (默认E, 可自定义)
 do
-local TargetRow = Instance.new("Frame")
-TargetRow.Size = UDim2.new(1, 0, 0, 38)
-TargetRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
-TargetRow.Parent = InterPage
-Instance.new("UICorner", TargetRow).CornerRadius = UDim.new(0, 8)
-local tgtLbl = Instance.new("TextLabel")
-tgtLbl.Size = UDim2.new(0.45, 0, 1, 0); tgtLbl.Position = UDim2.new(0, 12, 0, 0)
-tgtLbl.BackgroundTransparency = 1
-tgtLbl.Text = "目标: 全部"
-tgtLbl.TextColor3 = Color3.fromRGB(230,230,230); tgtLbl.Font = Enum.Font.Gotham; tgtLbl.TextSize = 13
-tgtLbl.TextXAlignment = Enum.TextXAlignment.Left; tgtLbl.Parent = TargetRow
-local tgtBtn = Instance.new("TextButton")
-tgtBtn.Size = UDim2.new(0, 80, 0, 26); tgtBtn.Position = UDim2.new(1, -92, 0.5, -13)
-tgtBtn.BackgroundColor3 = Color3.fromRGB(70, 110, 180); tgtBtn.Text = "选择"
-tgtBtn.TextColor3 = Color3.fromRGB(255,255,255); tgtBtn.Font = Enum.Font.GothamBold; tgtBtn.TextSize = 12
-tgtBtn.Parent = TargetRow; Instance.new("UICorner", tgtBtn).CornerRadius = UDim.new(0, 6)
-tgtBtn.MouseButton1Click:Connect(function()
-    local names = GetInteractNames()
-    if #names == 0 then
-        ShowNotification("自动互动", "请先点'刷新互动名称列表'", Color3.fromRGB(255, 150, 80))
-        return
-    end
-    -- 构建选择列表字符串
-    local listStr = "0. 全部\n"
-    for i, item in ipairs(names) do
-        if i > 20 then break end
-        listStr = listStr .. i .. ". " .. item.name .. " (" .. item.count .. "次)\n"
-    end
-    print("[自动互动] 可选目标编号:\n" .. listStr)
-    ShowNotification("自动互动", "可选目标已输出到控制台, 共" .. #names .. "项", Color3.fromRGB(100, 220, 180))
-    -- 弹出输入框 (使用简单的方式: 监听键盘输入数字)
-    ShowNotification("选择目标", "请在聊天框输入数字编号 (0=全部, 1-20=指定), 5秒内有效", Color3.fromRGB(255, 200, 80))
-    local conn
-    local selected = false
-    conn = UserInputService.TextBoxFocused:Connect(function(textbox)
-        -- 不处理
-    end)
-    -- 使用 InputBegan 监听数字键
-    local numConn
-    local inputStr = ""
-    numConn = UserInputService.InputBegan:Connect(function(input, gp)
-        if gp or selected then return end
+local KeyRow = Instance.new("Frame")
+KeyRow.Size = UDim2.new(1, 0, 0, 38)
+KeyRow.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
+KeyRow.Parent = InterPage
+Instance.new("UICorner", KeyRow).CornerRadius = UDim.new(0, 8)
+local keyLbl = Instance.new("TextLabel")
+keyLbl.Size = UDim2.new(0.5, 0, 1, 0); keyLbl.Position = UDim2.new(0, 12, 0, 0)
+keyLbl.BackgroundTransparency = 1
+local function keyShortName(k)
+    local s = tostring(k):gsub("Enum.KeyCode.", "")
+    return s
+end
+keyLbl.Text = "自动互动按键: " .. keyShortName(Config.AutoInteractKey or Enum.KeyCode.E)
+keyLbl.TextColor3 = Color3.fromRGB(230,230,230); keyLbl.Font = Enum.Font.Gotham; keyLbl.TextSize = 13
+keyLbl.TextXAlignment = Enum.TextXAlignment.Left; keyLbl.Parent = KeyRow
+local keyBtn = Instance.new("TextButton")
+keyBtn.Size = UDim2.new(0, 80, 0, 26); keyBtn.Position = UDim2.new(1, -92, 0.5, -13)
+keyBtn.BackgroundColor3 = Color3.fromRGB(70, 110, 180); keyBtn.Text = "设置"
+keyBtn.TextColor3 = Color3.fromRGB(255,255,255); keyBtn.Font = Enum.Font.GothamBold; keyBtn.TextSize = 12
+keyBtn.Parent = KeyRow; Instance.new("UICorner", keyBtn).CornerRadius = UDim.new(0, 6)
+keyBtn.MouseButton1Click:Connect(function()
+    ShowNotification("按键设置", "请按下想要的互动按键...", Color3.fromRGB(255, 200, 80))
+    local conn; conn = UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
         if input.UserInputType == Enum.UserInputType.Keyboard then
-            local key = tostring(input.KeyCode):gsub("Enum.KeyCode.", "")
-            -- 数字键 0-9
-            if #key == 4 and key:sub(1, 3) == "One" then key = "1"
-            elseif #key == 4 and key:sub(1, 3) == "Two" then key = "2"
-            elseif #key == 6 and key:sub(1, 5) == "Three" then key = "3"
-            elseif #key == 4 and key:sub(1, 4) == "Four" then key = "4"
-            elseif #key == 4 and key:sub(1, 4) == "Five" then key = "5"
-            elseif #key == 3 and key:sub(1, 3) == "Six" then key = "6"
-            elseif #key == 5 and key:sub(1, 5) == "Seven" then key = "7"
-            elseif #key == 5 and key:sub(1, 5) == "Eight" then key = "8"
-            elseif #key == 4 and key:sub(1, 4) == "Nine" then key = "9"
-            elseif key == "Zero" then key = "0"
-            elseif input.KeyCode == Enum.KeyCode.Return then
-                -- 确认
-                selected = true
-                local idx = tonumber(inputStr)
-                if idx == nil or idx == 0 then
-                    Config.AutoInteractTarget = ""
-                    tgtLbl.Text = "目标: 全部"
-                    ShowNotification("自动互动", "已选择: 全部", Color3.fromRGB(255, 200, 80))
-                elseif idx >= 1 and idx <= #names and idx <= 20 then
-                    Config.AutoInteractTarget = names[idx].name
-                    tgtLbl.Text = "目标: " .. names[idx].name
-                    ShowNotification("自动互动", "已选择: " .. names[idx].name, Color3.fromRGB(255, 200, 80))
-                else
-                    ShowNotification("自动互动", "编号无效", Color3.fromRGB(255, 80, 80))
-                end
-                if numConn then numConn:Disconnect() end
-                if conn then conn:Disconnect() end
-                return
-            else
-                return
-            end
-            inputStr = inputStr .. key
-            ShowNotification("输入中", "编号: " .. inputStr .. " (回车确认)", Color3.fromRGB(200, 200, 200))
+            Config.AutoInteractKey = input.KeyCode
+            keyLbl.Text = "自动互动按键: " .. keyShortName(input.KeyCode)
+            ShowNotification("自动互动按键", "已设置为: " .. keyShortName(input.KeyCode), Color3.fromRGB(255, 200, 80))
+            conn:Disconnect()
         end
     end)
-    -- 5秒超时
-    task.delay(8, function()
-        if not selected then
-            if numConn then numConn:Disconnect() end
-            if conn then conn:Disconnect() end
-            ShowNotification("自动互动", "选择超时", Color3.fromRGB(255, 80, 80))
+    task.delay(5, function()
+        if conn and conn.Connected then
+            conn:Disconnect()
+            ShowNotification("按键设置", "超时", Color3.fromRGB(255, 80, 80))
         end
     end)
 end)
-end -- TargetRow/tgtLbl/tgtBtn 释放
-MakeSlider(InterPage, "自动互动范围 (stud, 仅受限距离时有效)", 5, 500, 30, 1, function(v)
+end -- KeyRow 释放
+
+-- 当前目标显示
+local targetLabel
+do
+local TRow = Instance.new("Frame")
+TRow.Size = UDim2.new(1, 0, 0, 30)
+TRow.BackgroundColor3 = Color3.fromRGB(40, 42, 52)
+TRow.Parent = InterPage
+Instance.new("UICorner", TRow).CornerRadius = UDim.new(0, 8)
+targetLabel = Instance.new("TextLabel")
+targetLabel.Size = UDim2.new(1, -16, 1, 0); targetLabel.Position = UDim2.new(0, 12, 0, 0)
+targetLabel.BackgroundTransparency = 1
+targetLabel.Text = "当前目标: 全部 (默认互动周围)"
+targetLabel.TextColor3 = Color3.fromRGB(255, 200, 80); targetLabel.Font = Enum.Font.GothamBold; targetLabel.TextSize = 13
+targetLabel.TextXAlignment = Enum.TextXAlignment.Left; targetLabel.Parent = TRow
+end
+
+-- 可互动物品列表 (滚动, 点击选择)
+MakeLabel(InterPage, "已检测到的可互动物品 (点击选择):")
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, 0, 0, 160)
+listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.ScrollBarThickness = 6
+listFrame.BackgroundColor3 = Color3.fromRGB(28, 30, 40)
+listFrame.BorderSizePixel = 0
+listFrame.Parent = InterPage
+Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 8)
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 2)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = listFrame
+local listPad = Instance.new("UIPadding")
+listPad.PaddingTop = UDim.new(0, 4); listPad.PaddingBottom = UDim.new(0, 4)
+listPad.PaddingLeft = UDim.new(0, 4); listPad.PaddingRight = UDim.new(0, 4)
+listPad.Parent = listFrame
+
+local function RefreshInteractListUI()
+    if not listFrame.Parent then return end
+    -- 清空旧条目
+    for _, child in ipairs(listFrame:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    local names = GetInteractNames()
+    local curTarget = Config.AutoInteractTarget or ""
+    -- "全部" 选项
+    local allBtn = Instance.new("TextButton")
+    allBtn.Size = UDim2.new(1, 0, 0, 26)
+    allBtn.BackgroundColor3 = (curTarget == "") and Color3.fromRGB(60, 140, 100) or Color3.fromRGB(50, 52, 62)
+    allBtn.Text = "  全部  (默认互动周围, 不限名称)"
+    allBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    allBtn.Font = Enum.Font.Gotham; allBtn.TextSize = 12
+    allBtn.TextXAlignment = Enum.TextXAlignment.Left
+    allBtn.Parent = listFrame
+    Instance.new("UICorner", allBtn).CornerRadius = UDim.new(0, 5)
+    allBtn.MouseButton1Click:Connect(function()
+        Config.AutoInteractTarget = ""
+        if targetLabel then targetLabel.Text = "当前目标: 全部 (默认互动周围)" end
+        ShowNotification("自动互动", "已选择: 全部", Color3.fromRGB(255, 200, 80))
+        RefreshInteractListUI()
+    end)
+    -- 各名称条目
+    for i, item in ipairs(names) do
+        if i > 50 then break end
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 26)
+        btn.BackgroundColor3 = (curTarget == item.name) and Color3.fromRGB(60, 140, 100) or Color3.fromRGB(50, 52, 62)
+        local dispName = item.name
+        if #dispName > 28 then dispName = dispName:sub(1, 28) .. "…" end
+        btn.Text = "  " .. dispName .. "  (" .. item.count .. "次)"
+        btn.TextColor3 = Color3.fromRGB(255,255,255)
+        btn.Font = Enum.Font.Gotham; btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.Parent = listFrame
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+        local selName = item.name
+        btn.MouseButton1Click:Connect(function()
+            Config.AutoInteractTarget = selName
+            if targetLabel then targetLabel.Text = "当前目标: " .. selName end
+            ShowNotification("自动互动", "已选择: " .. selName, Color3.fromRGB(255, 200, 80))
+            RefreshInteractListUI()
+        end)
+    end
+end
+
+-- 手动刷新按钮 (备用, 自动检测开启时无需手动点)
+MakeButton(InterPage, "手动刷新列表 (自动检测开启时无需点)", function()
+    RefreshInteractNames()
+    ShowNotification("自动检测", "正在扫描, 1-2秒后列表更新", Color3.fromRGB(255, 200, 80))
+    task.delay(2, function() RefreshInteractListUI() end)
+end)
+
+-- 列表自动刷新协程 (自动检测开启时定期更新列表UI)
+task.spawn(function()
+    while listFrame.Parent do
+        if Config.AutoDetectInteract then
+            RefreshInteractListUI()
+        end
+        task.wait(3)
+    end
+end)
+
+-- 初次填充 (异步等待首次扫描完成)
+task.delay(2, function() RefreshInteractListUI() end)
+
+-- 启动时若自动检测已开启, 立即开始后台扫描 (无需手动点击)
+if Config.AutoDetectInteract then
+    task.spawn(function() pcall(StartAutoDetect) end)
+end
+
+MakeSlider(InterPage, "自动互动范围 (stud, 限距离时有效)", 5, 500, 30, 1, function(v)
     Config.AutoInteractRange = v
 end)
 MakeSlider(InterPage, "自动互动间隔 (秒, 越大越不卡)", 0.1, 5, 0.5, 0.1, function(v)
     Config.AutoInteractInterval = v
 end)
-MakeToggle(InterPage, "不受距离限制 (全图触发, 推荐)", true, function(v)
+MakeToggle(InterPage, "不受距离限制 (全图触发, 关=只互动周围)", false, function(v)
     Config.AutoInteractIgnoreDist = v
+    ShowNotification("自动互动", v and "已开启全图触发" or "已切换为只互动周围", Color3.fromRGB(255, 200, 80))
 end)
 
 -- ====== 自动修改 (刷新互动增强, 开关模式) ======
@@ -5181,7 +5318,7 @@ MakeButton(SetPage, "关闭所有功能", function()
     ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
     if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
     Xray.RefreshConn = nil
-    pcall(StopAutoInteract); pcall(StopAutoModify)
+    pcall(StopAutoInteract); pcall(StopAutoDetect); pcall(StopAutoModify)
     ApplyNightVision(); ApplySpeed(); ApplyJump(); ApplyFly(); ApplyTeleWalk(); ApplyNoclip(); ApplyFastInteract()
     ApplyInfiniteJump(); ApplyFloat(); ApplyGhostMode()
     ShowNotification("设置", "已关闭所有功能", Color3.fromRGB(255, 100, 100))
@@ -5258,8 +5395,9 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         -- 关闭特效简化/超级简化 (还原所有修改)
         pcall(StopFXSimplify)
         pcall(StopSuperSimplify)
-        -- 关闭自动互动/自动修改
+        -- 关闭自动互动/自动检测/自动修改
         pcall(StopAutoInteract)
+        pcall(StopAutoDetect)
         pcall(StopAutoModify)
         ApplyNightVision()
         local hum = GetHum()
