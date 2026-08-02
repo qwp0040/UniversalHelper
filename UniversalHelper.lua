@@ -2528,6 +2528,8 @@ local function ApplyFakeRagdoll()
             if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
             -- 停止动画 (防R15动画包持续驱动Motor6D Transform, 导致四肢不瘫软)
             StopAllAnimations(hum)
+            -- 禁用 RequireNeck/自平衡相关属性, 防游戏强制站立
+            pcall(function() hum.RequiresNeck = false end)
             -- PlatformStand + 物理倒地 (碰撞体积改变, 名字Billboard跟随身体)
             hum.PlatformStand = true
             hum.AutoRotate = false
@@ -2589,17 +2591,38 @@ local function ApplyFakeRagdoll()
         if hrp then
             pcall(function()
                 -- 给一个初始倾倒力让自然倒地
-                hrp.AssemblyAngularVelocity = Vector3.new(5, 0, 0)
+                hrp.AssemblyAngularVelocity = Vector3.new(8, 0, 0)
             end)
+            -- 保存 RootJoint 原始值, 用于直接把身体躺平 (防 PlatformStand 被游戏覆盖导致还站着)
+            local char0 = LocalPlayer.Character
+            if char0 then
+                local rj = FindRootJoint(char0)
+                if rj and not Fun.SavedMotors[rj] then
+                    Fun.SavedMotors[rj] = {C0 = rj.C0, C1 = rj.C1}
+                end
+            end
         end
         -- 搞笑爬行移动: WASD时给一个低矮的水平速度 + 小幅抖动 (像在地上拱)
         -- 注意: 半空中不施加Y速度, 让重力正常下落, 避免悬空
         Fun.RagdollConn = RunService.Heartbeat:Connect(function(dt)
             if not Config.FakeRagdoll then return end
             local h = GetHRP(); local hum = GetHum()
+            local c = LocalPlayer.Character
             if not h or not hum then return end
-            -- 持续保持趴下状态
+            -- 持续强制趴下状态 (每帧重设, 防游戏服务端覆盖 PlatformStand 导致又站起来)
             if hum.PlatformStand == false then hum.PlatformStand = true end
+            if hum.AutoRotate == true then hum.AutoRotate = false end
+            -- 直接旋转 RootJoint 让身体躺平 (绕X轴90度=趴下), 不依赖PlatformStand物理倒地
+            -- 这样即使游戏覆盖PlatformStand, 身体也会被强制趴下
+            if c then
+                local rj = FindRootJoint(c)
+                if rj and Fun.SavedMotors[rj] then
+                    pcall(function()
+                        rj.C0 = Fun.SavedMotors[rj].C0 * CFrame.Angles(math.rad(85), 0, 0)
+                        rj.Transform = CFrame.Angles(math.rad(85), 0, 0)
+                    end)
+                end
+            end
             -- 周期性停止动画 (R15动画包可能重新播放, 把已禁用的Motor6D驱动起来)
             Fun._ragdollStopTick = (Fun._ragdollStopTick or 0) + dt
             if Fun._ragdollStopTick > 2 then
