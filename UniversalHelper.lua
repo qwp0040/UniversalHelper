@@ -4122,7 +4122,7 @@ task.wait()
 
 -- ============== 视觉页 ==============
 local GhostToggle  -- 前向声明 (UpdateGhostToggleUI 后面需要引用)
-do
+(function()
 local VisPage = AddNav("视觉", "visual")
 MakeLabel(VisPage, "== 玩家透视 ==")
 MakeToggle(VisPage, "透视玩家 (ESP)", false, function(v)
@@ -4301,10 +4301,10 @@ MakeButton(VisPage, "立即刷新一次", function()
     ClearAllPlayerESP(); task.wait(0.1); RefreshESP()
     ShowNotification("刷新", "已手动刷新透视对象", Color3.fromRGB(100, 180, 220))
 end)
-end -- VisPage 释放
+end)()
 
 -- ============== NPC功能页 ==============
-do
+(function()
 local NPCPage = AddNav("NPC功能", "npc")
 
 MakeLabel(NPCPage, "== NPC 透视 ==")
@@ -4399,10 +4399,10 @@ MakeToggle(NPCPage, "NPC击杀 (范围内自动击杀)", false, function(v)
     ShowNotification("NPC击杀", v and "已开启 - 范围内NPC自动击杀" or "已关闭", v and Color3.fromRGB(255,80,80) or Color3.fromRGB(180,180,180))
 end)
 MakeSlider(NPCPage, "击杀范围 (1~200)", 1, 200, 50, 1, function(v) Config.NPCKillRange = v end)
-end -- NPCPage 释放
+end)()
 
 -- ============== 移动页 ==============
-do
+(function()
 local MovePage = AddNav("移动", "move")
 MakeLabel(MovePage, "== 移动速度 ==")
 MakeToggle(MovePage, "修改移动速度", false, function(v) Config.SpeedEnabled = v; ApplySpeed(); ShowNotification("移动速度", v and "已开启" or "已关闭", v and Color3.fromRGB(100,180,220) or Color3.fromRGB(180,180,180)) end)
@@ -4433,10 +4433,10 @@ MakeToggle(MovePage, "悬浮模式 (WASD移动 Q下降E上升)", false, function
     Config.FloatMode = v; ApplyFloat()
 end)
 MakeSlider(MovePage, "悬浮速度 (1~100)", 1, 100, 30, 0.1, function(v) Config.FloatSpeed = v end)
-end -- MovePage 释放
+end)()
 
 -- ============== 互动页 ==============
-do
+(function()
 local InterPage = AddNav("互动", "interact")
 MakeLabel(InterPage, "== 智能快速互动 ==")
 MakeToggle(InterPage, "快速互动 (自动检测类型并加速)", false, function(v)
@@ -4742,7 +4742,7 @@ end -- ModeRow/modeLbl/modeBtn 释放
 MakeSlider(InterPage, "全部重复模式间隔 (秒, 越小越防回调但越卡)", 0.5, 10, 2, 0.1, function(v)
     Config.AutoModifyInterval = v
 end)
-end -- InterPage 释放
+end)()
 
 -- ============== 枪械检测/修改窗口 + 颜色选择器 + 外出UI ==============
 -- 前向声明 Weapon 和 DetectWeapon (实际定义在后面, 但这些函数需要引用同一个upvalue)
@@ -5521,15 +5521,16 @@ function CloseCombatMiniUI()
 end
 
 -- ============== 检测/修改页 ==============
-do local WpnPage = AddNav("检测/修改", "weapon")
+(function()
+local WpnPage = AddNav("检测/修改", "weapon")
 MakeLabel(WpnPage, "== 枪械检测/修改 ==")
 MakeButton(WpnPage, "枪械检测/修改 (点击启动专属界面)", function()
     OpenWeaponWindow()
 end)
-end
+end)()
 
 -- ============== 格斗适用页 ==============
-do
+(function()
 local CmbPage = AddNav("格斗适用", "combat")
 MakeLabel(CmbPage, "== 格斗总开关 ==")
 MakeToggle(CmbPage, "格斗功能总开关", false, function(v)
@@ -5635,10 +5636,10 @@ MakeToggle(CmbPage, "开启外出UI (小型同步UI)", false, function(v)
     if v then OpenCombatMiniUI() else CloseCombatMiniUI() end
     ShowNotification("外出UI", v and "已开启" or "已关闭", v and Color3.fromRGB(180,80,255) or Color3.fromRGB(180,180,180))
 end)
-end -- CmbPage 释放
+end)()
 
 -- ============== 娱乐页 ==============
-do
+(function()
 local FunPage = AddNav("娱乐", "fun")
 MakeLabel(FunPage, "== 直升机旋转 ==")
 MakeLabel(FunPage, "开启后展开双臂快速旋转 + 自动飞行, WASD移动, Q下降E上升")
@@ -5669,10 +5670,10 @@ MakeToggle(FunPage, "假布娃娃", false, function(v)
     Config.FakeRagdoll = v
     ApplyFakeRagdoll()
 end)
-end -- FunPage 释放
+end)()
 
 -- ============== 优化页 (服务器特效简化) ==============
-do
+(function()
 local OptPage = AddNav("优化", "optimize")
 MakeLabel(OptPage, "== 服务器特效简化 ==")
 MakeLabel(OptPage, "说明: 保留特效但大幅降低渲染负担, 慢速分批处理防闪退")
@@ -5817,10 +5818,10 @@ end)
 MakeToggle(OptPage, "移除SpecialMesh (谨慎, 可能看不见模型)", false, function(v)
     Config.SSRemoveMeshes = v
 end)
-end -- OptPage 释放
+end)()
 
 -- ============== 设置页 ==============
-do
+(function()
 local SetPage = AddNav("设置", "settings")
 MakeLabel(SetPage, "== 通知系统 ==")
 MakeToggle(SetPage, "全部通知 (总开关)", true, function(v)
@@ -6036,7 +6037,7 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         pcall(function() if Ghost.StatusGui then Ghost.StatusGui:Destroy() end end)
     end)
 end)
-end -- SetPage 释放
+end)()
 
 -- 更新日志页
 do
@@ -6711,50 +6712,49 @@ local function SetupCombatHotkey()
     end)
 end
 
+-- 把收尾初始化 + 主循环拆到独立函数: 避免主 task.spawn 闭包局部变量溢出 Luau 200 寄存器上限
+local function FinalInitAndMainLoop()
+    SetupGhostShortcut()
+    SetupCombatHotkey()
+    CreateCombatLockUI()
+    UpdateLockColor()
+    if Config.GhostStatusBar then CreateGhostStatusBar() end
+    local MainState = {
+        NPC_LastSlowScan = 0,
+        NPC_LastHealthUpdate = 0,
+        Combat_LastFrame = 0,
+        Weapon_LastCheck = 0,
+    }
+    RunService.Heartbeat:Connect(function()
+        local now = tick()
+        if Config.NPCESP and now - MainState.NPC_LastSlowScan >= 0.15 then
+            MainState.NPC_LastSlowScan = now
+            SlowScanNPCs()
+        end
+        if Config.NPCESP and Config.NPCShowHealth and now - MainState.NPC_LastHealthUpdate >= 0.5 then
+            MainState.NPC_LastHealthUpdate = now
+            UpdateNPCHealthLabels()
+        end
+        if Config.NPCKill then ProcessNPCKill() end
+        if Config.InteractESP then
+            ProcessInteractQueue()
+            UpdateInteractBillboards()
+            CleanInteractCache()
+        end
+        if Config.CombatEnabled and now - MainState.Combat_LastFrame >= 0.02 then
+            MainState.Combat_LastFrame = now
+            CombatFrame()
+        end
+        if Config.WeaponInfAmmo and now - MainState.Weapon_LastCheck >= 0.1 then
+            MainState.Weapon_LastCheck = now
+            WeaponInfAmmoTick()
+        end
+    end)
+    ShowNotification("通用辅助", "v3.8 加载完成", Color3.fromRGB(80, 180, 120))
+    print("[通用辅助] v3.8 加载完成")
+end
+
 task.wait()
-
-SetupGhostShortcut()
-SetupCombatHotkey()
-CreateCombatLockUI()
-UpdateLockColor()
-
-if Config.GhostStatusBar then CreateGhostStatusBar() end
-
--- 主循环: NPC慢速扫描 + NPC击杀 + 互动透视 + NPC血量更新 + 格斗系统
--- NPC扫描限频: 每0.15秒才执行一次, 避免每帧调用导致卡顿
-local NPC_LastSlowScan = 0
-local NPC_LastHealthUpdate = 0
-local Combat_LastFrame = 0
-RunService.Heartbeat:Connect(function()
-    local now = tick()
-    if Config.NPCESP and now - NPC_LastSlowScan >= 0.15 then
-        NPC_LastSlowScan = now
-        SlowScanNPCs()
-    end
-    -- NPC血量文字更新 (每0.5秒, 避免每帧遍历)
-    if Config.NPCESP and Config.NPCShowHealth and now - NPC_LastHealthUpdate >= 0.5 then
-        NPC_LastHealthUpdate = now
-        UpdateNPCHealthLabels()
-    end
-    if Config.NPCKill then ProcessNPCKill() end
-    if Config.InteractESP then
-        ProcessInteractQueue()
-        UpdateInteractBillboards()
-        CleanInteractCache()
-    end
-    -- 格斗系统 (每帧, 帧限频0.02秒)
-    if Config.CombatEnabled and now - Combat_LastFrame >= 0.02 then
-        Combat_LastFrame = now
-        CombatFrame()
-    end
-    -- 无限子弹 (每0.1秒检查)
-    if Config.WeaponInfAmmo and now - (Weapon_LastCheck or 0) >= 0.1 then
-        Weapon_LastCheck = now
-        WeaponInfAmmoTick()
-    end
-end)
-
-ShowNotification("通用辅助", "v3.8 加载完成", Color3.fromRGB(80, 180, 120))
-print("[通用辅助] v3.8 加载完成")
+FinalInitAndMainLoop()
 
 end)  -- task.spawn end
