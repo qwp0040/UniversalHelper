@@ -4122,7 +4122,7 @@ task.wait()
 
 -- ============== 视觉页 ==============
 local GhostToggle  -- 前向声明 (UpdateGhostToggleUI 后面需要引用)
-(function()
+;(function()
 local VisPage = AddNav("视觉", "visual")
 MakeLabel(VisPage, "== 玩家透视 ==")
 MakeToggle(VisPage, "透视玩家 (ESP)", false, function(v)
@@ -4304,7 +4304,7 @@ end)
 end)()
 
 -- ============== NPC功能页 ==============
-(function()
+;(function()
 local NPCPage = AddNav("NPC功能", "npc")
 
 MakeLabel(NPCPage, "== NPC 透视 ==")
@@ -4402,7 +4402,7 @@ MakeSlider(NPCPage, "击杀范围 (1~200)", 1, 200, 50, 1, function(v) Config.NP
 end)()
 
 -- ============== 移动页 ==============
-(function()
+;(function()
 local MovePage = AddNav("移动", "move")
 MakeLabel(MovePage, "== 移动速度 ==")
 MakeToggle(MovePage, "修改移动速度", false, function(v) Config.SpeedEnabled = v; ApplySpeed(); ShowNotification("移动速度", v and "已开启" or "已关闭", v and Color3.fromRGB(100,180,220) or Color3.fromRGB(180,180,180)) end)
@@ -4436,7 +4436,7 @@ MakeSlider(MovePage, "悬浮速度 (1~100)", 1, 100, 30, 0.1, function(v) Config
 end)()
 
 -- ============== 互动页 ==============
-(function()
+;(function()
 local InterPage = AddNav("互动", "interact")
 MakeLabel(InterPage, "== 智能快速互动 ==")
 MakeToggle(InterPage, "快速互动 (自动检测类型并加速)", false, function(v)
@@ -5521,7 +5521,7 @@ function CloseCombatMiniUI()
 end
 
 -- ============== 检测/修改页 ==============
-(function()
+;(function()
 local WpnPage = AddNav("检测/修改", "weapon")
 MakeLabel(WpnPage, "== 枪械检测/修改 ==")
 MakeButton(WpnPage, "枪械检测/修改 (点击启动专属界面)", function()
@@ -5530,7 +5530,7 @@ end)
 end)()
 
 -- ============== 格斗适用页 ==============
-(function()
+;(function()
 local CmbPage = AddNav("格斗适用", "combat")
 MakeLabel(CmbPage, "== 格斗总开关 ==")
 MakeToggle(CmbPage, "格斗功能总开关", false, function(v)
@@ -5639,7 +5639,7 @@ end)
 end)()
 
 -- ============== 娱乐页 ==============
-(function()
+;(function()
 local FunPage = AddNav("娱乐", "fun")
 MakeLabel(FunPage, "== 直升机旋转 ==")
 MakeLabel(FunPage, "开启后展开双臂快速旋转 + 自动飞行, WASD移动, Q下降E上升")
@@ -5673,7 +5673,7 @@ end)
 end)()
 
 -- ============== 优化页 (服务器特效简化) ==============
-(function()
+;(function()
 local OptPage = AddNav("优化", "optimize")
 MakeLabel(OptPage, "== 服务器特效简化 ==")
 MakeLabel(OptPage, "说明: 保留特效但大幅降低渲染负担, 慢速分批处理防闪退")
@@ -5821,7 +5821,7 @@ end)
 end)()
 
 -- ============== 设置页 ==============
-(function()
+;(function()
 local SetPage = AddNav("设置", "settings")
 MakeLabel(SetPage, "== 通知系统 ==")
 MakeToggle(SetPage, "全部通知 (总开关)", true, function(v)
