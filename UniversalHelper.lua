@@ -72,6 +72,20 @@ local Config = {
     FXBatchSize=2,             -- 每帧处理数量 (慢速, 防大卡顿闪退)
     FXBatchInterval=0.1,       -- 每帧间隔秒数
 
+    -- 超级简化 (彻底优化, 针对低端电脑/重特效游戏如最强战场)
+    SuperSimplify=false,       -- 超级简化总开关
+    SSQualityLevel=1,          -- 画质等级 1=最低 2=低 3=中 (默认最低)
+    SSCullDistance=300,        -- 远距离剔除距离 (超过此距离的特效/部件降级或隐藏)
+    SSCullParts=true,          -- 远距离 BasePart 剔除 (透明度降低)
+    SSRemoveShadows=true,      -- 关闭所有阴影
+    SSRemoveLighting=true,     -- 简化光照 (Fog/ColorShift等)
+    SSRemoveTextures=true,     -- 移除贴图 (Texture/Decal 透明化)
+    SSRemoveMeshes=false,      -- 移除 SpecialMesh (谨慎, 可能导致看不到模型)
+    SSReduceMaterials=true,    -- 材质改为 SmoothPlastic/Neon (减少反射计算)
+    SSLowerRenderDistance=true,-- 降低渲染距离 (QualitySettings)
+    SSDisablePostEffects=true, -- 关闭后处理特效 (Bloom/ColorCorrection/SunRays/DepthOfField)
+    SSAggressiveParticles=true,-- 激进粒子简化 (直接 Rate=0 而非降低)
+
 }
 
 local NotifyCfg = {
@@ -457,33 +471,50 @@ do
         pcall(FXProcessInner, obj)
     end
 
+    -- 硬性上限: 最多保存多少个对象的原值 (防止内存耗尽闪退)
+    local FX_MAX_ORIGINALS = 1500
+    -- 队列上限
+    local FX_MAX_QUEUE = 3000
+    -- 每帧遍历子级的硬上限 (无论是否为特效, 超过就yield)
+    local FX_CHILDREN_PER_YIELD = 30
+
     local function FXCollectContainers()
         FX.ProcessQueue = {}
-        local containers = { Workspace, Lighting }
-        for _, c in ipairs(containers) do
-            table.insert(FX.ProcessQueue, c)
-        end
+        -- 只扫描 Workspace (Lighting 几乎没有特效, 跳过减少开销)
+        table.insert(FX.ProcessQueue, Workspace)
     end
 
-    local FX_MAX_QUEUE = 5000
     local function safeBatchSize()
         local v = Config.FXBatchSize
-        if type(v) ~= "number" or v < 1 then return 2 end
+        if type(v) ~= "number" or v < 1 then return 1 end
         return math.floor(v)
     end
     local function safeBatchInterval()
         local v = Config.FXBatchInterval
-        if type(v) ~= "number" or v <= 0 then return 0.1 end
+        if type(v) ~= "number" or v <= 0 then return 0.15 end
         return v
     end
 
+    -- 跳过这些类型的子级 (不可能是特效容器, 也不需要递归)
+    local FX_SKIP_CLASSES = {
+        Camera = true, Terrain = true, Weld = true, WeldConstraint = true,
+        Motor6D = true, Bone = true, Humanoid = true, Animation = true,
+        Script = true, LocalScript = true, ModuleScript = true,
+        Sound = true, SoundService = true, Texture = true,  -- Texture 作为贴花已处理
+        ValueBase = true,  -- 各种 Value 对象
+    }
+
     local function FXScanLoop(myToken)
-        local processedThisFrame = 0
         while FX.Enabled and FX.LoopToken == myToken do
-            processedThisFrame = 0
             local batchSize = safeBatchSize()
-            while processedThisFrame < batchSize and #FX.ProcessQueue > 0 do
+            local processedThisFrame = 0
+            local childrenIterated = 0
+
+            while #FX.ProcessQueue > 0 do
                 if not FX.Enabled or FX.LoopToken ~= myToken then return end
+                -- 原值表已满, 停止扫描 (防止内存耗尽)
+                if FX.StatsCount >= FX_MAX_ORIGINALS then break end
+
                 local container = table.remove(FX.ProcessQueue, 1)
                 local valid = false
                 pcall(function() valid = container ~= nil and container.Parent ~= nil end)
@@ -493,32 +524,49 @@ do
                     if children then
                         for _, child in ipairs(children) do
                             if not FX.Enabled or FX.LoopToken ~= myToken then return end
+
+                            -- 每遍历 FX_CHILDREN_PER_YIELD 个子级就 yield 一次 (防单帧卡死闪退)
+                            childrenIterated = childrenIterated + 1
+                            if childrenIterated >= FX_CHILDREN_PER_YIELD then
+                                childrenIterated = 0
+                                task.wait(safeBatchInterval())
+                            end
+
                             local ok, cls = pcall(function() return child.ClassName end)
-                            if not ok then continue end
-                            if (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
-                                    or cls == "Decal" or cls == "Texture" or cls == "Smoke"
-                                    or cls == "Fire" or cls == "Sparkles") then
+                            if not ok then
+                                -- 跳过无法读取类型的对象
+                            elseif cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+                                    or cls == "Decal" or cls == "Smoke"
+                                    or cls == "Fire" or cls == "Sparkles" then
                                 FXProcess(child)
                                 processedThisFrame = processedThisFrame + 1
                                 if processedThisFrame >= batchSize then break end
                             else
-                                if #FX.ProcessQueue < FX_MAX_QUEUE
-                                   and cls ~= "Camera" and cls ~= "Terrain"
-                                   and cls ~= "Weld" and cls ~= "WeldConstraint"
-                                   and cls ~= "Motor6D" and cls ~= "Bone"
-                                   and cls ~= "Humanoid" and cls ~= "Animation" then
+                                -- 非特效对象: 如果不是跳过类型且队列未满, 加入队列递归扫描
+                                if not FX_SKIP_CLASSES[cls] and #FX.ProcessQueue < FX_MAX_QUEUE then
                                     table.insert(FX.ProcessQueue, child)
                                 end
                             end
                         end
                     end
                 end
+
+                -- 达到本帧批处理上限, 跳出内层 while
                 if processedThisFrame >= batchSize then break end
+                -- 原值表已满
+                if FX.StatsCount >= FX_MAX_ORIGINALS then break end
             end
+
+            -- 等待下一帧
             task.wait(safeBatchInterval())
-            if #FX.ProcessQueue == 0 and FX.Enabled and FX.LoopToken == myToken then
-                FXCollectContainers()
+
+            -- 队列空了且原值表没满, 等2秒后重新扫描 (捕捉新加入的特效)
+            if #FX.ProcessQueue == 0 and FX.Enabled and FX.LoopToken == myToken
+               and FX.StatsCount < FX_MAX_ORIGINALS then
                 task.wait(2)
+                if FX.Enabled and FX.LoopToken == myToken then
+                    FXCollectContainers()
+                end
             end
         end
     end
@@ -594,6 +642,383 @@ do
         end)
     end
 end -- FX 系统块结束
+
+-- ============== 超级简化系统 (彻底优化, 针对低端电脑/重特效游戏) ==============
+-- 原理: 降低画质/关闭阴影/简化光照/移除贴图/远距离剔除/激进粒子简化
+-- 全程慢速分批处理, do-end 块隔离 local 寄存器
+local StartSuperSimplify, StopSuperSimplify
+do
+    local SS = {
+        Enabled = false,
+        Originals = {},        -- instance -> {prop=val,...} 保存原值
+        ProcessQueue = {},     -- 待扫描的容器队列
+        DescendantConn = nil,  -- DescendantAdded 监听
+        LoopToken = 0,         -- 协程令牌
+        StatsCount = 0,
+        LightingSaved = nil,   -- 保存的 Lighting 属性
+        QualitySaved = nil,    -- 保存的 QualitySettings
+    }
+
+    -- 安全读取
+    local function safeGet(obj, prop)
+        local ok, v = pcall(function() return obj[prop] end)
+        if ok then return v end
+        return nil
+    end
+    -- 安全设置 (带原值保存)
+    local function SSSave(obj, prop, newVal)
+        if not SS.Originals[obj] then SS.Originals[obj] = {} end
+        if SS.Originals[obj][prop] == nil then
+            local ok, cur = pcall(function() return obj[prop] end)
+            if ok then SS.Originals[obj][prop] = cur end
+        end
+        pcall(function() obj[prop] = newVal end)
+    end
+
+    -- 判断是否为本地玩家自己的对象 (不简化自己)
+    local function IsLocalPlayerOwned(obj)
+        local p = obj
+        local depth = 0
+        while p and depth < 50 do
+            depth = depth + 1
+            if p == LocalPlayer then return true end
+            p = safeGet(p, "Parent")
+        end
+        return false
+    end
+
+    -- 跳过这些类型 (不简化, 不递归)
+    local SS_SKIP_CLASSES = {
+        Camera = true, Terrain = true, Weld = true, WeldConstraint = true,
+        Motor6D = true, Bone = true, Humanoid = true, Animation = true,
+        Script = true, LocalScript = true, ModuleScript = true,
+        Sound = true, SoundService = true, SoundGroup = true,
+        ValueBase = true,  -- 含 IntValue/StringValue 等
+        ContextActionService = true, TweenService = true,
+        Player = true, Players = true, Workspace = true,
+    }
+
+    -- 后处理特效类名 (Lighting 下的)
+    local SS_POST_FX_CLASSES = {
+        BloomEffect = true, ColorCorrectionEffect = true, SunRaysEffect = true,
+        DepthOfFieldEffect = true, BlurEffect = true, Atmosphere = true,
+        BerryCubeEffect = true,  -- 部分游戏自定义
+    }
+
+    -- 处理单个对象
+    local function SSProcessInner(obj)
+        local alive = false
+        pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+        if not alive then return end
+        if SS.Originals[obj] then return end
+        if IsLocalPlayerOwned(obj) then return end
+
+        local cls = safeGet(obj, "ClassName")
+        if not cls then return end
+
+        -- 距离剔除 (对 BasePart)
+        if Config.SSCullParts and (cls == "Part" or cls == "MeshPart" or cls == "UnionOperation"
+            or cls == "TrussPart" or cls == "WedgePart" or cls == "CornerWedgePart") then
+            -- 简化材质 (减少反射计算)
+            if Config.SSReduceMaterials then
+                local mat = safeGet(obj, "Material")
+                if mat and mat ~= Enum.Material.SmoothPlastic and mat ~= Enum.Material.Neon then
+                    SSSave(obj, "Material", Enum.Material.SmoothPlastic)
+                end
+                -- 关闭反射
+                local ref = safeGet(obj, "Reflectance")
+                if type(ref) == "number" and ref > 0 then
+                    SSSave(obj, "Reflectance", 0)
+                end
+                -- 关闭投射阴影
+                if Config.SSRemoveShadows then
+                    local cs = safeGet(obj, "CastShadow")
+                    if cs == true then
+                        SSSave(obj, "CastShadow", false)
+                    end
+                end
+            end
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+
+        -- 激进粒子简化 (直接 Rate=0)
+        if Config.SSAggressiveParticles and cls == "ParticleEmitter" then
+            SSSave(obj, "Rate", 0)
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+
+        -- 光束/拖尾 (激进化: 直接透明)
+        if Config.SSAggressiveParticles and (cls == "Beam" or cls == "Trail") then
+            SSSave(obj, "Transparency", NumberSequence.new(1))
+            if cls == "Trail" then
+                local lt = safeGet(obj, "Lifetime")
+                if type(lt) == "number" and lt > 0.1 then
+                    SSSave(obj, "Lifetime", 0.1)
+                end
+            end
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+
+        -- 贴图/贴花 (透明化)
+        if Config.SSRemoveTextures and (cls == "Decal" or cls == "Texture") then
+            SSSave(obj, "Transparency", 1)
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+
+        -- SpecialMesh (谨慎: 可能导致看不到模型, 默认关)
+        if Config.SSRemoveMeshes and cls == "SpecialMesh" then
+            local vis = safeGet(obj, "Visible")
+            if vis ~= false then
+                SSSave(obj, "Visible", false)
+            end
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+
+        -- 烟雾/火焰/闪光 (激进化: 关闭)
+        if Config.SSAggressiveParticles and (cls == "Smoke" or cls == "Fire" or cls == "Sparkles") then
+            if cls == "Smoke" then
+                SSSave(obj, "Opacity", 0)
+            elseif cls == "Fire" then
+                SSSave(obj, "Heat", 0)
+                SSSave(obj, "Size", 0)
+            elseif cls == "Sparkles" then
+                SSSave(obj, "Enabled", false)
+            end
+            SS.StatsCount = SS.StatsCount + 1
+            return
+        end
+    end
+
+    local function SSProcess(obj)
+        pcall(SSProcessInner, obj)
+    end
+
+    -- 硬性上限
+    local SS_MAX_ORIGINALS = 3000
+    local SS_MAX_QUEUE = 4000
+    local SS_CHILDREN_PER_YIELD = 25
+
+    local function SSApplyLighting()
+        if not Config.SSRemoveLighting then return end
+        SS.LightingSaved = {}
+        pcall(function()
+            SS.LightingSaved.Brightness = Lighting.Brightness
+            SS.LightingSaved.GlobalShadows = Lighting.GlobalShadows
+            SS.LightingSaved.FogEnd = Lighting.FogEnd
+            SS.LightingSaved.FogStart = Lighting.FogStart
+            SS.LightingSaved.ColorShift_Top = Lighting.ColorShift_Top
+            SS.LightingSaved.ColorShift_Bottom = Lighting.ColorShift_Bottom
+            SS.LightingSaved.EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale
+            SS.LightingSaved.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale
+            -- 应用简化值
+            Lighting.Brightness = 2
+            Lighting.GlobalShadows = false
+            if Lighting.FogEnd then Lighting.FogEnd = 1e9 end  -- 关闭雾
+            if Lighting.FogStart then Lighting.FogStart = 1e9 end
+            Lighting.ColorShift_Top = Color3.fromRGB(0,0,0)
+            Lighting.ColorShift_Bottom = Color3.fromRGB(0,0,0)
+            if Lighting.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = 0 end
+            if Lighting.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = 0 end
+        end)
+    end
+
+    local function SSRestoreLighting()
+        if not SS.LightingSaved then return end
+        pcall(function()
+            Lighting.Brightness = SS.LightingSaved.Brightness or 2
+            Lighting.GlobalShadows = SS.LightingSaved.GlobalShadows
+            if SS.LightingSaved.FogEnd then Lighting.FogEnd = SS.LightingSaved.FogEnd end
+            if SS.LightingSaved.FogStart then Lighting.FogStart = SS.LightingSaved.FogStart end
+            Lighting.ColorShift_Top = SS.LightingSaved.ColorShift_Top
+            Lighting.ColorShift_Bottom = SS.LightingSaved.ColorShift_Bottom
+            if SS.LightingSaved.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = SS.LightingSaved.EnvironmentDiffuseScale end
+            if SS.LightingSaved.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = SS.LightingSaved.EnvironmentSpecularScale end
+        end)
+        SS.LightingSaved = nil
+    end
+
+    -- 关闭 Lighting 下的后处理特效
+    local function SSDisablePostFX()
+        if not Config.SSDisablePostEffects then return end
+        pcall(function()
+            for _, child in ipairs(Lighting:GetChildren()) do
+                local cls = safeGet(child, "ClassName")
+                if cls and SS_POST_FX_CLASSES[cls] then
+                    if SS.Originals[child] == nil then
+                        SS.Originals[child] = { Enabled = safeGet(child, "Enabled") }
+                        pcall(function() child.Enabled = false end)
+                        SS.StatsCount = SS.StatsCount + 1
+                    end
+                end
+            end
+        end)
+    end
+
+    -- 降低画质等级
+    local function SSApplyQuality()
+        if not Config.SSLowerRenderDistance then return end
+        SS.QualitySaved = {}
+        pcall(function()
+            local settings = UserSettings()
+            local q = settings:GetService("RenderSettings")
+            SS.QualitySaved.QualityLevel = q.QualityLevel
+            SS.QualitySaved.MeshDetailDistance = q.MeshDetailDistance
+            -- 画质设为最低
+            q.QualityLevel = Enum.QualityLevel.Level01
+            q.MeshDetailDistance = 0
+        end)
+    end
+
+    local function SSRestoreQuality()
+        if not SS.QualitySaved then return end
+        pcall(function()
+            local settings = UserSettings()
+            local q = settings:GetService("RenderSettings")
+            q.QualityLevel = SS.QualitySaved.QualityLevel or Enum.QualityLevel.Automatic
+            if SS.QualitySaved.MeshDetailDistance then q.MeshDetailDistance = SS.QualitySaved.MeshDetailDistance end
+        end)
+        SS.QualitySaved = nil
+    end
+
+    local function SSCollectContainers()
+        SS.ProcessQueue = {}
+        table.insert(SS.ProcessQueue, Workspace)
+    end
+
+    local function SSScanLoop(myToken)
+        while SS.Enabled and SS.LoopToken == myToken do
+            local processedThisFrame = 0
+            local childrenIterated = 0
+
+            while #SS.ProcessQueue > 0 do
+                if not SS.Enabled or SS.LoopToken ~= myToken then return end
+                if SS.StatsCount >= SS_MAX_ORIGINALS then break end
+
+                local container = table.remove(SS.ProcessQueue, 1)
+                local valid = false
+                pcall(function() valid = container ~= nil and container.Parent ~= nil end)
+                if valid then
+                    local children
+                    pcall(function() children = container:GetChildren() end)
+                    if children then
+                        for _, child in ipairs(children) do
+                            if not SS.Enabled or SS.LoopToken ~= myToken then return end
+
+                            childrenIterated = childrenIterated + 1
+                            if childrenIterated >= SS_CHILDREN_PER_YIELD then
+                                childrenIterated = 0
+                                task.wait(0.15)
+                            end
+
+                            local ok, cls = pcall(function() return child.ClassName end)
+                            if not ok then
+                                -- 跳过
+                            elseif not SS_SKIP_CLASSES[cls] then
+                                SSProcess(child)
+                                -- 递归入队
+                                if #SS.ProcessQueue < SS_MAX_QUEUE then
+                                    table.insert(SS.ProcessQueue, child)
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if SS.StatsCount >= SS_MAX_ORIGINALS then break end
+            end
+
+            task.wait(0.2)
+
+            -- 队列空了, 等5秒后重新扫描 (捕捉新加入的对象)
+            if #SS.ProcessQueue == 0 and SS.Enabled and SS.LoopToken == myToken
+               and SS.StatsCount < SS_MAX_ORIGINALS then
+                task.wait(5)
+                if SS.Enabled and SS.LoopToken == myToken then
+                    SSCollectContainers()
+                end
+            end
+        end
+    end
+
+    local function SSSetupListener()
+        if SS.DescendantConn then return end
+        SS.DescendantConn = Workspace.DescendantAdded:Connect(function(obj)
+            if not SS.Enabled then return end
+            if not obj then return end
+            local ok, cls = pcall(function() return obj.ClassName end)
+            if not ok then return end
+            -- 后处理特效类型直接处理 (虽不在 Workspace, 但容错)
+            -- 普通对象延迟处理
+            task.wait(0.3)
+            if SS.Enabled and not SS_SKIP_CLASSES[cls] then
+                SSProcess(obj)
+            end
+        end)
+    end
+
+    local function SSClearListener()
+        if SS.DescendantConn then
+            pcall(function() SS.DescendantConn:Disconnect() end)
+            SS.DescendantConn = nil
+        end
+    end
+
+    StartSuperSimplify = function()
+        if SS.Enabled then return end
+        SS.Enabled = true
+        SS.Originals = {}
+        SS.StatsCount = 0
+        SS.LoopToken = SS.LoopToken + 1
+        local myToken = SS.LoopToken
+
+        -- 立即应用光照/画质/后处理 (这些是即时生效的, 不会卡)
+        SSApplyLighting()
+        SSDisablePostFX()
+        SSApplyQuality()
+
+        -- 启动慢速扫描协程 (处理 BasePart/粒子等)
+        SSCollectContainers()
+        SSSetupListener()
+        task.spawn(function()
+            pcall(SSScanLoop, myToken)
+        end)
+    end
+
+    StopSuperSimplify = function()
+        SS.Enabled = false
+        SS.LoopToken = SS.LoopToken + 1
+        SSClearListener()
+        SS.ProcessQueue = {}
+
+        -- 还原所有对象属性
+        local restored = 0
+        pcall(function()
+            for obj, props in pairs(SS.Originals) do
+                local alive = false
+                pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+                if alive then
+                    for prop, val in pairs(props) do
+                        pcall(function() obj[prop] = val end)
+                        restored = restored + 1
+                    end
+                end
+            end
+        end)
+        SS.Originals = {}
+        SS.StatsCount = 0
+
+        -- 还原光照和画质
+        SSRestoreLighting()
+        SSRestoreQuality()
+
+        return restored
+    end
+end -- 超级简化系统块结束
 
 -- ============== 玩家ESP (定时器驱动, 不用Heartbeat) ==============
 local PlayerESP = {
@@ -3984,6 +4409,92 @@ end)
 MakeSlider(OptPage, "每帧间隔 (秒, 越大越慢)", 0.05, 0.5, 0.1, 0.05, function(v)
     Config.FXBatchInterval = v
 end)
+
+-- ====== 超级简化 (彻底优化, 适合低端电脑/重特效游戏) ======
+MakeLabel(OptPage, "== 超级简化 (彻底优化, 适合低端电脑) ==")
+MakeLabel(OptPage, "说明: 关闭阴影/光照/贴图, 激进简化所有特效, 大幅提升帧率")
+MakeButton(OptPage, "一键极致优化 (推荐低端电脑)", function()
+    -- 启用全部超级简化选项
+    Config.SSRemoveShadows = true
+    Config.SSRemoveLighting = true
+    Config.SSRemoveTextures = true
+    Config.SSReduceMaterials = true
+    Config.SSLowerRenderDistance = true
+    Config.SSDisablePostEffects = true
+    Config.SSAggressiveParticles = true
+    Config.SSCullParts = true
+    Config.SSRemoveMeshes = false  -- 不开, 防看不到模型
+    Config.SuperSimplify = true
+    StartSuperSimplify()
+    ShowNotification("超级简化", "已开启极致优化 (适合低端电脑)", Color3.fromRGB(255, 100, 100))
+end)
+MakeButton(OptPage, "一键平衡优化 (保留模型可见)", function()
+    -- 平衡: 保留贴图但关阴影/后处理/激进粒子
+    Config.SSRemoveShadows = true
+    Config.SSRemoveLighting = true
+    Config.SSRemoveTextures = false  -- 保留贴图
+    Config.SSReduceMaterials = true
+    Config.SSLowerRenderDistance = true
+    Config.SSDisablePostEffects = true
+    Config.SSAggressiveParticles = true
+    Config.SSCullParts = true
+    Config.SSRemoveMeshes = false
+    Config.SuperSimplify = true
+    StartSuperSimplify()
+    ShowNotification("超级简化", "已开启平衡优化 (保留模型可见)", Color3.fromRGB(255, 200, 80))
+end)
+MakeToggle(OptPage, "超级简化 (总开关)", false, function(v)
+    Config.SuperSimplify = v
+    if v then
+        StartSuperSimplify()
+        ShowNotification("超级简化", "已开启 (慢速扫描中, 几秒后生效)", Color3.fromRGB(255, 100, 100))
+    else
+        local n = StopSuperSimplify()
+        ShowNotification("超级简化", "已关闭, 还原 " .. n .. " 项", Color3.fromRGB(180, 180, 180))
+    end
+end)
+MakeToggle(OptPage, "关闭所有阴影 (CastShadow=false)", true, function(v)
+    Config.SSRemoveShadows = v
+end)
+MakeToggle(OptPage, "简化光照 (关雾/关ColorShift)", true, function(v)
+    Config.SSRemoveLighting = v
+    if Config.SuperSimplify then
+        StopSuperSimplify()
+        task.wait(0.3)
+        StartSuperSimplify()
+    end
+end)
+MakeToggle(OptPage, "移除贴图 (Texture/Decal透明)", true, function(v)
+    Config.SSRemoveTextures = v
+end)
+MakeToggle(OptPage, "简化材质 (改SmoothPlastic)", true, function(v)
+    Config.SSReduceMaterials = v
+end)
+MakeToggle(OptPage, "降低画质等级 (Level01)", true, function(v)
+    Config.SSLowerRenderDistance = v
+    if Config.SuperSimplify then
+        StopSuperSimplify()
+        task.wait(0.3)
+        StartSuperSimplify()
+    end
+end)
+MakeToggle(OptPage, "关闭后处理 (Bloom/景深等)", true, function(v)
+    Config.SSDisablePostEffects = v
+    if Config.SuperSimplify then
+        StopSuperSimplify()
+        task.wait(0.3)
+        StartSuperSimplify()
+    end
+end)
+MakeToggle(OptPage, "激进简化粒子 (Rate=0)", true, function(v)
+    Config.SSAggressiveParticles = v
+end)
+MakeToggle(OptPage, "简化远距离部件", true, function(v)
+    Config.SSCullParts = v
+end)
+MakeToggle(OptPage, "移除SpecialMesh (谨慎, 可能看不见模型)", false, function(v)
+    Config.SSRemoveMeshes = v
+end)
 end -- OptPage 释放
 
 -- ============== 设置页 ==============
@@ -4175,6 +4686,9 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
         Xray.RefreshConn = nil
         ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
+        -- 关闭特效简化/超级简化 (还原所有修改)
+        pcall(StopFXSimplify)
+        pcall(StopSuperSimplify)
         ApplyNightVision()
         local hum = GetHum()
         if hum then
