@@ -4100,7 +4100,7 @@ MakeButton(SetPage, "关闭所有功能", function()
     Config.TeleWalk=false; Config.Noclip=false; Config.FastInteract=false; Config.InteractESP=false; Config.AutoRefresh=false
     Config.WallAutoRefresh=false; Config.InfiniteJump=false; Config.FloatMode=false; Config.GhostMode=false; Config.NPCKill=false
     ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
-    if Xray.Conn then Xray.Conn:Disconnect() Xray.Conn=nil end
+    if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
     Xray.RefreshConn = nil
     ApplyNightVision(); ApplySpeed(); ApplyJump(); ApplyFly(); ApplyTeleWalk(); ApplyNoclip(); ApplyFastInteract()
     ApplyInfiniteJump(); ApplyFloat(); ApplyGhostMode()
@@ -4155,24 +4155,24 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         Config.FloatMode=false; Config.GhostMode=false; Config.NPCKill=false
         if Move.SpeedConn then Move.SpeedConn=nil end
         if Move.JumpConn then Move.JumpConn=nil end
-        if Move.FlyConn then Move.FlyConn:Disconnect() Move.FlyConn=nil end
-        if Move.TeleConn then Move.TeleConn:Disconnect() Move.TeleConn=nil end
-        if Saved.FloatConn then Saved.FloatConn:Disconnect() Saved.FloatConn=nil end
-        if NoclipConn then NoclipConn:Disconnect() NoclipConn=nil end
-        if NoclipCleanupConn then NoclipCleanupConn:Disconnect() NoclipCleanupConn=nil end
-        if NoclipChildAddedConn then NoclipChildAddedConn:Disconnect() NoclipChildAddedConn=nil end
-        if Saved.JumpConn then Saved.JumpConn:Disconnect() Saved.JumpConn=nil end
-        if Ghost.Conn then Ghost.Conn:Disconnect() Ghost.Conn=nil end
-        if Ghost.CamConn then Ghost.CamConn:Disconnect() Ghost.CamConn=nil end
-        if Ghost.FreezeConn then Ghost.FreezeConn:Disconnect() Ghost.FreezeConn=nil end
+        if Move.FlyConn then Move.FlyConn:Disconnect(); Move.FlyConn=nil end
+        if Move.TeleConn then Move.TeleConn:Disconnect(); Move.TeleConn=nil end
+        if Saved.FloatConn then Saved.FloatConn:Disconnect(); Saved.FloatConn=nil end
+        if NoclipConn then NoclipConn:Disconnect(); NoclipConn=nil end
+        if NoclipCleanupConn then NoclipCleanupConn:Disconnect(); NoclipCleanupConn=nil end
+        if NoclipChildAddedConn then NoclipChildAddedConn:Disconnect(); NoclipChildAddedConn=nil end
+        if Saved.JumpConn then Saved.JumpConn:Disconnect(); Saved.JumpConn=nil end
+        if Ghost.Conn then Ghost.Conn:Disconnect(); Ghost.Conn=nil end
+        if Ghost.CamConn then Ghost.CamConn:Disconnect(); Ghost.CamConn=nil end
+        if Ghost.FreezeConn then Ghost.FreezeConn:Disconnect(); Ghost.FreezeConn=nil end
         if Ghost.OriginalMouseBehavior then
             UserInputService.MouseBehavior = Ghost.OriginalMouseBehavior
             Ghost.OriginalMouseBehavior = nil
         end
         StopCacheListeners()
-        if Interact.ChildAddedConn then Interact.ChildAddedConn:Disconnect() Interact.ChildAddedConn=nil end
-        if Interact.ChildRemovedConn then Interact.ChildRemovedConn:Disconnect() Interact.ChildRemovedConn=nil end
-        if Xray.Conn then Xray.Conn:Disconnect() Xray.Conn=nil end
+        if Interact.ChildAddedConn then Interact.ChildAddedConn:Disconnect(); Interact.ChildAddedConn=nil end
+        if Interact.ChildRemovedConn then Interact.ChildRemovedConn:Disconnect(); Interact.ChildRemovedConn=nil end
+        if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
         Xray.RefreshConn = nil
         ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
         ApplyNightVision()
