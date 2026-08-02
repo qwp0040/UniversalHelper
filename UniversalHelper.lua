@@ -58,6 +58,20 @@ local Config = {
     -- 游戏检测
     GameTypeDetected="未检测",
 
+    -- 服务器特效简化 (保留特效但大幅降低渲染负担)
+    FXSimplify=false,          -- 总开关
+    FXSimplifyParticles=true,  -- 简化粒子发射器
+    FXSimplifyBeams=true,      -- 简化光束
+    FXSimplifyTrails=true,     -- 简化拖尾
+    FXSimplifyDecals=true,     -- 简化贴花(降透明度而非删除)
+    FXSimplifySmoke=true,      -- 简化烟雾/火焰
+    FXParticleRate=0.15,       -- 粒子发射率保留比例 (15%)
+    FXBeamTransparency=0.7,    -- 光束透明度提升至 0.7
+    FXTrailTransparency=0.7,   -- 拖尾透明度提升至 0.7
+    FXDecalTransparency=0.6,   -- 贴花透明度提升至 0.6
+    FXBatchSize=2,             -- 每帧处理数量 (慢速, 防大卡顿闪退)
+    FXBatchInterval=0.1,       -- 每帧间隔秒数
+
 }
 
 local NotifyCfg = {
@@ -313,6 +327,201 @@ local function ShowNotification(title, text, color)
 end
 
 task.wait()
+
+-- ============== 服务器特效简化系统 (保留但不删除, 仅降低渲染负担) ==============
+-- 原理: 把粒子发射率/光束透明度/拖尾长度等参数调低, 特效仍存在但更轻量
+-- 慢速分批处理, 每帧只改 Config.FXBatchSize 个对象, 避免一次性扫描导致闪退
+local FX = {
+    Enabled = false,
+    Originals = {},       -- instance -> {prop=val,...} 保存原值用于还原
+    ProcessQueue = {},    -- 待扫描的容器
+    ScanConn = nil,
+    PendingChildConn = {},-- 监听新特效产生的连接
+    StatsCount = 0,
+}
+
+-- 判断对象是否属于本地玩家自己 (避免简化自己手持武器的特效)
+local function IsLocalPlayerOwned(obj)
+    local p = obj
+    while p and p ~= game do
+        if p == LocalPlayer then return true end
+        if p:IsA("Player") and p == LocalPlayer then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+-- 保存原值 (仅第一次)
+local function FXSave(obj, prop, newVal)
+    if not FX.Originals[obj] then FX.Originals[obj] = {} end
+    if FX.Originals[obj][prop] == nil then
+        local ok, cur = pcall(function() return obj[prop] end)
+        if ok then FX.Originals[obj][prop] = cur end
+    end
+    pcall(function() obj[prop] = newVal end)
+end
+
+-- 处理单个特效对象
+local function FXProcess(obj)
+    if not obj or not obj.Parent then return end
+    if FX.Originals[obj] then return end  -- 已处理过
+    if IsLocalPlayerOwned(obj) then return end  -- 跳过本地玩家自身
+
+    local ok, cls = pcall(function() return obj.ClassName end)
+    if not ok then return end
+
+    if Config.FXSimplifyParticles and cls == "ParticleEmitter" then
+        -- 降低发射率 (Rate), 缩短生命周期, 降低速度
+        local origRate = obj.Rate
+        if origRate and origRate > 1 then
+            FXSave(obj, "Rate", math.max(0, math.floor(origRate * Config.FXParticleRate)))
+        end
+        if obj.Lifetime then
+            local mn, mx = obj.Lifetime.Min, obj.Lifetime.Max
+            FXSave(obj, "Lifetime", NumberSequence.new(mn * 0.7, mx * 0.7))
+        end
+        if obj.Speed then
+            local mn, mx = obj.Speed.Min, obj.Speed.Max
+            FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
+        end
+        FX.StatsCount = FX.StatsCount + 1
+    elseif Config.FXSimplifyBeams and cls == "Beam" then
+        -- 提高透明度 (保留但更淡)
+        FXSave(obj, "Transparency", NumberSequence.new(Config.FXBeamTransparency))
+        if obj.Width0 and obj.Width0 > 0.1 then
+            FXSave(obj, "Width0", obj.Width0 * 0.5)
+        end
+        if obj.Width1 and obj.Width1 > 0.1 then
+            FXSave(obj, "Width1", obj.Width1 * 0.5)
+        end
+        FX.StatsCount = FX.StatsCount + 1
+    elseif Config.FXSimplifyTrails and cls == "Trail" then
+        FXSave(obj, "Transparency", NumberSequence.new(Config.FXTrailTransparency))
+        if obj.Lifetime and obj.Lifetime > 0.2 then
+            FXSave(obj, "Lifetime", obj.Lifetime * 0.6)
+        end
+        FX.StatsCount = FX.StatsCount + 1
+    elseif Config.FXSimplifyDecals and (cls == "Decal" or cls == "Texture") then
+        -- 降低透明度而非删除
+        FXSave(obj, "Transparency", Config.FXDecalTransparency)
+        FX.StatsCount = FX.StatsCount + 1
+    elseif Config.FXSimplifySmoke and (cls == "Smoke" or cls == "Fire" or cls == "Explosion" or cls == "Sparkles") then
+        -- 烟雾/火焰: 降低大小或不透明度
+        if cls == "Smoke" then
+            FXSave(obj, "Opacity", 0.1)
+            if obj.Size then FXSave(obj, "Size", math.max(0.5, obj.Size * 0.3)) end
+        elseif cls == "Fire" then
+            FXSave(obj, "Heat", math.max(0, obj.Heat * 0.2))
+            FXSave(obj, "Size", math.max(0.5, obj.Size * 0.3))
+        end
+        FX.StatsCount = FX.StatsCount + 1
+    end
+end
+
+-- 收集待处理对象 (按容器分批, 不一次性全扫描)
+local function FXCollectContainers()
+    FX.ProcessQueue = {}
+    -- 主要特效容器: Workspace (玩家武器/特效/烟雾弹等都在此), Lighting (天空/光照特效), ReplicatedStorage (有时缓存特效)
+    local containers = { Workspace, Lighting }
+    for _, c in ipairs(containers) do
+        table.insert(FX.ProcessQueue, c)
+    end
+end
+
+-- 慢速分批扫描协程
+local function FXScanLoop()
+    local processedThisFrame = 0
+    while FX.Enabled do
+        processedThisFrame = 0
+        -- 处理队列里的容器, 每帧最多 Config.FXBatchSize 个对象
+        while processedThisFrame < Config.FXBatchSize and #FX.ProcessQueue > 0 do
+            local container = table.remove(FX.ProcessQueue, 1)
+            if container and container.Parent then
+                -- 限制单容器直接子级数量, 避免巨型模型一次性展开
+                local children
+                pcall(function() children = container:GetChildren() end)
+                if children then
+                    for _, child in ipairs(children) do
+                        -- 直接处理(若是特效对象) 或 加入队列待后续展开
+                        local ok, cls = pcall(function() return child.ClassName end)
+                        if ok and (cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+                                or cls == "Decal" or cls == "Texture" or cls == "Smoke"
+                                or cls == "Fire" or cls == "Sparkles") then
+                            FXProcess(child)
+                            processedThisFrame = processedThisFrame + 1
+                            if processedThisFrame >= Config.FXBatchSize then break end
+                        elseif ok and child:IsA("Instance") then
+                            -- 非特效对象加入队列, 等下轮展开
+                            table.insert(FX.ProcessQueue, child)
+                        end
+                    end
+                end
+            end
+            -- 防死循环: 如果队列过长且都无新增, 让出
+            if processedThisFrame >= Config.FXBatchSize then break end
+        end
+        task.wait(Config.FXBatchInterval)
+        -- 队列空了重新收集 (捕获新特效, 如新投出的烟雾弹)
+        if #FX.ProcessQueue == 0 and FX.Enabled then
+            FXCollectContainers()
+            task.wait(2)  -- 每轮扫描间隔2秒, 慢速避免卡顿
+        end
+    end
+end
+
+-- 监听新特效生成 (烟雾弹投出后才出现, 需要动态捕获)
+local function FXSetupListeners()
+    if #FX.PendingChildConn > 0 then return end
+    -- Workspace 新增子对象 (烟雾弹/特效模型等)
+    local conn1 = Workspace.DescendantAdded:Connect(function(obj)
+        if not FX.Enabled then return end
+        if not obj then return end
+        local ok, cls = pcall(function() return obj.ClassName end)
+        if not ok then return end
+        if cls == "ParticleEmitter" or cls == "Beam" or cls == "Trail"
+           or cls == "Decal" or cls == "Texture" or cls == "Smoke"
+           or cls == "Fire" or cls == "Sparkles" then
+            task.wait(0.2)  -- 等属性初始化
+            FXProcess(obj)
+        end
+    end)
+    table.insert(FX.PendingChildConn, conn1)
+end
+
+local function FXClearListeners()
+    for _, c in ipairs(FX.PendingChildConn) do pcall(function() c:Disconnect() end) end
+    FX.PendingChildConn = {}
+end
+
+-- 启动简化
+local function StartFXSimplify()
+    if FX.Enabled then return end
+    FX.Enabled = true
+    FX.Originals = {}
+    FX.StatsCount = 0
+    FXCollectContainers()
+    FXSetupListeners()
+    task.spawn(FXScanLoop)
+end
+
+-- 停止并还原所有特效
+local function StopFXSimplify()
+    FX.Enabled = false
+    FXClearListeners()
+    -- 还原原值
+    local restored = 0
+    for obj, props in pairs(FX.Originals) do
+        if obj and obj.Parent then
+            for prop, val in pairs(props) do
+                pcall(function() obj[prop] = val end)
+                restored = restored + 1
+            end
+        end
+    end
+    FX.Originals = {}
+    FX.ProcessQueue = {}
+    return restored
+end
 
 -- ============== 玩家ESP (定时器驱动, 不用Heartbeat) ==============
 local PlayerESP = {
@@ -3622,6 +3831,69 @@ MakeToggle(CmbPage, "开启外出UI (小型同步UI)", false, function(v)
     Config.CombatMiniUI = v
     if v then OpenCombatMiniUI() else CloseCombatMiniUI() end
     ShowNotification("外出UI", v and "已开启" or "已关闭", v and Color3.fromRGB(180,80,255) or Color3.fromRGB(180,180,180))
+end)
+
+-- ============== 优化页 (服务器特效简化) ==============
+local OptPage = AddNav("优化", "optimize")
+MakeLabel(OptPage, "== 服务器特效简化 ==")
+MakeLabel(OptPage, "说明: 保留特效但大幅降低渲染负担, 慢速分批处理防闪退")
+MakeToggle(OptPage, "启用特效简化 (总开关)", false, function(v)
+    Config.FXSimplify = v
+    if v then
+        StartFXSimplify()
+        ShowNotification("特效简化", "已开启 (慢速扫描中, 几秒后生效)", Color3.fromRGB(100,220,180))
+    else
+        local n = StopFXSimplify()
+        ShowNotification("特效简化", "已关闭, 还原 " .. n .. " 项", Color3.fromRGB(180,180,180))
+    end
+end)
+MakeToggle(OptPage, "简化粒子发射器", true, function(v)
+    Config.FXSimplifyParticles = v
+    if not Config.FXSimplify then return end
+    -- 重新扫描以应用新设置
+    task.spawn(function()
+        StopFXSimplify(); task.wait(0.3); StartFXSimplify()
+    end)
+end)
+MakeToggle(OptPage, "简化光束 (Beam)", true, function(v)
+    Config.FXSimplifyBeams = v
+    if not Config.FXSimplify then return end
+    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+end)
+MakeToggle(OptPage, "简化拖尾 (Trail)", true, function(v)
+    Config.FXSimplifyTrails = v
+    if not Config.FXSimplify then return end
+    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+end)
+MakeToggle(OptPage, "简化贴花 (Decal)", true, function(v)
+    Config.FXSimplifyDecals = v
+    if not Config.FXSimplify then return end
+    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+end)
+MakeToggle(OptPage, "简化烟雾/火焰", true, function(v)
+    Config.FXSimplifySmoke = v
+    if not Config.FXSimplify then return end
+    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+end)
+MakeLabel(OptPage, "== 强度调节 ==")
+MakeSlider(OptPage, "粒子保留比例 (越小越简化)", 0.01, 1.0, 0.15, 0.01, function(v)
+    Config.FXParticleRate = v
+end)
+MakeSlider(OptPage, "光束透明度 (越大越淡)", 0.0, 0.95, 0.7, 0.05, function(v)
+    Config.FXBeamTransparency = v
+end)
+MakeSlider(OptPage, "拖尾透明度 (越大越淡)", 0.0, 0.95, 0.7, 0.05, function(v)
+    Config.FXTrailTransparency = v
+end)
+MakeSlider(OptPage, "贴花透明度 (越大越淡)", 0.0, 0.95, 0.6, 0.05, function(v)
+    Config.FXDecalTransparency = v
+end)
+MakeLabel(OptPage, "== 处理速度 (越慢越稳) ==")
+MakeSlider(OptPage, "每帧处理数量 (1-5, 越小越不易卡)", 1, 5, 2, 1, function(v)
+    Config.FXBatchSize = math.floor(v)
+end)
+MakeSlider(OptPage, "每帧间隔 (秒, 越大越慢)", 0.05, 0.5, 0.1, 0.05, function(v)
+    Config.FXBatchInterval = v
 end)
 
 -- ============== 设置页 ==============
