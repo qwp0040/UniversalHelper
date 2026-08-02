@@ -318,6 +318,10 @@ task.wait()
 local PlayerESP = {
     Highlights = {}, Billboards = {}, Connections = {}, RefreshConn = nil,
 }
+-- 文本缓存 (避免每帧重复设置TextLabel.Text产生GC和重排开销)
+local PlayerESP_LastDist = {}    -- char -> 上次距离字符串
+local PlayerESP_LastHealth = {}  -- char -> 上次血量字符串
+local PlayerESP_LastColor = {}   -- char -> 上次颜色
 
 local function IsTeammate(player)
     if not Config.TeamCheck then return false end
@@ -392,11 +396,15 @@ local function RemovePlayerESP(character)
     end)
     PlayerESP.Highlights[character] = nil
     PlayerESP.Billboards[character] = nil
+    PlayerESP_LastDist[character] = nil
+    PlayerESP_LastHealth[character] = nil
+    PlayerESP_LastColor[character] = nil
 end
 
 local function ClearAllPlayerESP()
     for char, _ in pairs(PlayerESP.Highlights) do RemovePlayerESP(char) end
     PlayerESP.Highlights = {}; PlayerESP.Billboards = {}
+    PlayerESP_LastDist = {}; PlayerESP_LastHealth = {}; PlayerESP_LastColor = {}
     for char, conns in pairs(PlayerESP.Connections) do
         for _, conn in pairs(conns) do pcall(function() conn:Disconnect() end) end
     end
@@ -421,38 +429,60 @@ local function UpdatePlayerESP()
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if not hrp then continue end
         local color = IsTeammate(player) and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 80, 80)
+        -- Highlight (仅颜色变化时才写入)
         if not PlayerESP.Highlights[char] or not PlayerESP.Highlights[char].Parent then
             local hl = CreatePlayerHL(char, color)
             if hl then PlayerESP.Highlights[char] = hl end
-        else
+        elseif PlayerESP_LastColor[char] ~= color then
             PlayerESP.Highlights[char].FillColor = color
         end
+        -- Billboard
         local bb = PlayerESP.Billboards[char]
         if not bb or not bb.Parent then
             bb = CreatePlayerBB(char, player)
             if bb then PlayerESP.Billboards[char] = bb end
         end
         if bb then
-            local distLbl = bb:FindFirstChild("DistLabel")
-            if distLbl and myHRP then
-                local dist = (myPos - hrp.Position).Magnitude
-                distLbl.Text = string.format("%.1fm", dist)
+            -- 实时同步显示开关 (无需重新开关ESP即可生效)
+            local nl = bb:FindFirstChild("NameLabel")
+            local hl = bb:FindFirstChild("HealthLabel")
+            local dl = bb:FindFirstChild("DistLabel")
+            if nl then
+                if nl.Visible ~= Config.PlayerShowName then nl.Visible = Config.PlayerShowName end
+                if PlayerESP_LastColor[char] ~= color then nl.TextColor3 = color end
             end
-            local nameLbl = bb:FindFirstChild("NameLabel")
-            if nameLbl then nameLbl.TextColor3 = color end
-            -- 血量显示
-            local healthLbl = bb:FindFirstChild("HealthLabel")
-            if healthLbl then
+            if hl then
+                if hl.Visible ~= Config.PlayerShowHealth then hl.Visible = Config.PlayerShowHealth end
+                -- 血量文字 (仅在变化时写入, 减少GC和重排)
                 local hum = char:FindFirstChildOfClass("Humanoid")
                 if hum then
-                    healthLbl.Text = string.format("%d/%d", math.floor(hum.Health), math.floor(hum.MaxHealth))
-                    local hpct = hum.MaxHealth > 0 and hum.Health / hum.MaxHealth or 0
-                    if hpct > 0.6 then healthLbl.TextColor3 = Color3.fromRGB(120, 220, 120)
-                    elseif hpct > 0.3 then healthLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
-                    else healthLbl.TextColor3 = Color3.fromRGB(255, 80, 80) end
+                    local htxt = string.format("%d/%d", math.floor(hum.Health), math.floor(hum.MaxHealth))
+                    if PlayerESP_LastHealth[char] ~= htxt then
+                        PlayerESP_LastHealth[char] = htxt
+                        hl.Text = htxt
+                        local hpct = hum.MaxHealth > 0 and hum.Health / hum.MaxHealth or 0
+                        local hcol
+                        if hpct > 0.6 then hcol = Color3.fromRGB(120, 220, 120)
+                        elseif hpct > 0.3 then hcol = Color3.fromRGB(255, 200, 80)
+                        else hcol = Color3.fromRGB(255, 80, 80) end
+                        hl.TextColor3 = hcol
+                    end
+                end
+            end
+            if dl then
+                if dl.Visible ~= Config.PlayerShowDist then dl.Visible = Config.PlayerShowDist end
+                -- 距离文字 (仅在变化时写入)
+                if myHRP then
+                    local dist = (myPos - hrp.Position).Magnitude
+                    local dtxt = string.format("%.1fm", dist)
+                    if PlayerESP_LastDist[char] ~= dtxt then
+                        PlayerESP_LastDist[char] = dtxt
+                        dl.Text = dtxt
+                    end
                 end
             end
         end
+        PlayerESP_LastColor[char] = color
         if not PlayerESP.Connections[char] then
             PlayerESP.Connections[char] = {}
             table.insert(PlayerESP.Connections[char], char.AncestryChanged:Connect(function(_, parent)
@@ -466,12 +496,12 @@ local function RefreshESP()
     ClearAllPlayerESP()
     if not Config.PlayerESP then return end
     UpdatePlayerESP()
-    -- 用 task.spawn 循环代替 Heartbeat, 每0.3秒更新一次 (大幅减少卡顿)
+    -- 用 task.spawn 循环代替 Heartbeat, 每0.5秒更新一次 (缓存命中时几乎零开销)
     PlayerESP.RefreshConn = true
     task.spawn(function()
         while PlayerESP.RefreshConn and Config.PlayerESP do
             UpdatePlayerESP()
-            task.wait(0.3)
+            task.wait(0.5)
         end
     end)
 end
@@ -488,6 +518,33 @@ local function UpdatePlayerLabelVisibility()
             if dl then dl.Visible = Config.PlayerShowDist end
         end
     end
+end
+
+-- 主动监听新玩家加入/离开 + 角色重生 (无需开启"自动刷新"即可实时透视新玩家)
+local PlayerJoinConn, PlayerLeaveConn
+local function SetupPlayerJoinListeners()
+    if PlayerJoinConn then return end
+    PlayerJoinConn = Players.PlayerAdded:Connect(function(plr)
+        -- 角色加载后立即触发一次ESP更新 (角色可能延迟生成, 监听CharacterAdded兜底)
+        local function tryAdd()
+            if not Config.PlayerESP then return end
+            if plr.Character then
+                task.wait(0.2)  -- 等HRP生成
+                if Config.PlayerESP then UpdatePlayerESP() end
+            else
+                local conn
+                conn = plr.CharacterAdded:Connect(function()
+                    task.wait(0.3)
+                    if Config.PlayerESP then UpdatePlayerESP() end
+                    if conn then conn:Disconnect() end
+                end)
+            end
+        end
+        task.spawn(tryAdd)
+    end)
+    PlayerLeaveConn = Players.PlayerRemoving:Connect(function(plr)
+        if plr and plr.Character then RemovePlayerESP(plr.Character) end
+    end)
 end
 
 -- 玩家ESP自动刷新 (定时重新扫描全部玩家, 捕获新加入/离开的玩家)
@@ -730,6 +787,7 @@ end
 
 local function StartCacheListeners()
     if NPCChildAddedConn then return end
+    -- 顶层 ChildAdded (快速路径, 捕获直接放在Workspace的NPC)
     NPCChildAddedConn = Workspace.ChildAdded:Connect(function(child)
         if child:IsA("Model") then
             OnModelAdded(child)
@@ -745,11 +803,27 @@ local function StartCacheListeners()
     NPCChildRemovedConn = Workspace.ChildRemoved:Connect(function(child)
         OnModelRemoved(child)
     end)
+    -- DescendantAdded 兜底 (捕获任意层级新生成的NPC, 如Workspace.Map.Spawn.NPC1)
+    -- 处理两种时序: 模型先于Humanoid加入 / Humanoid后加入模型
+    NPC_ESP.DescConn = Workspace.DescendantAdded:Connect(function(obj)
+        if not obj then return end
+        if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+            -- 模型加入时已含Humanoid
+            OnModelAdded(obj)
+        elseif obj:IsA("Humanoid") then
+            -- Humanoid后加入模型, 向上找Character模型
+            local model = obj.Parent
+            if model and model:IsA("Model") then
+                OnModelAdded(model)
+            end
+        end
+    end)
 end
 
 local function StopCacheListeners()
     if NPCChildAddedConn then NPCChildAddedConn:Disconnect() NPCChildAddedConn = nil end
     if NPCChildRemovedConn then NPCChildRemovedConn:Disconnect() NPCChildRemovedConn = nil end
+    if NPC_ESP.DescConn then NPC_ESP.DescConn:Disconnect() NPC_ESP.DescConn = nil end
 end
 
 local function ClearAllNPCESP()
@@ -867,29 +941,33 @@ local function SlowScanNPCs()
         end)
     end
 
-    -- 处理队列: 每0.1秒最多处理1个 (慢速逐个透视)
+    -- 处理队列: 每0.1秒最多处理3个 (新NPC快速透视)
     -- 数量上限检查: 达到MAX_NPC_ESP就不再新增, 防止Highlight累积卡退
     if #NPC_ESP.ProcessQueue > 0 and GetActiveESPCount() < MAX_NPC_ESP then
         if not NPC_ESP._lastProcess or now - NPC_ESP._lastProcess >= 0.1 then
             NPC_ESP._lastProcess = now
-            local model = table.remove(NPC_ESP.ProcessQueue, 1)
-            if model and model.Parent and not NPC_ESP.Highlights[model] then
-                local displayName = TranslateNPCName(model.Name)
-                local hl = CreateNPCHL(model, color)
-                local bb, distLbl = CreateNPCBB(model, color, displayName)
-                if hl then
-                    NPC_ESP.Highlights[model] = hl
-                    NPC_ESP.ActiveModels[model] = true
-                    if bb then
-                        local nl = bb:FindFirstChild("NameLabel")
-                        local hlb = bb:FindFirstChild("HealthLabel")
-                        local dl = bb:FindFirstChild("DistLabel")
-                        if nl then nl.Visible = Config.NPCShowName end
-                        if hlb then hlb.Visible = Config.NPCShowHealth end
-                        if dl then dl.Visible = Config.NPCShowDist end
+            local processed = 0
+            while processed < 3 and #NPC_ESP.ProcessQueue > 0 and GetActiveESPCount() < MAX_NPC_ESP do
+                local model = table.remove(NPC_ESP.ProcessQueue, 1)
+                processed += 1
+                if model and model.Parent and not NPC_ESP.Highlights[model] then
+                    local displayName = TranslateNPCName(model.Name)
+                    local hl = CreateNPCHL(model, color)
+                    local bb, distLbl = CreateNPCBB(model, color, displayName)
+                    if hl then
+                        NPC_ESP.Highlights[model] = hl
+                        NPC_ESP.ActiveModels[model] = true
+                        if bb then
+                            local nl = bb:FindFirstChild("NameLabel")
+                            local hlb = bb:FindFirstChild("HealthLabel")
+                            local dl = bb:FindFirstChild("DistLabel")
+                            if nl then nl.Visible = Config.NPCShowName end
+                            if hlb then hlb.Visible = Config.NPCShowHealth end
+                            if dl then dl.Visible = Config.NPCShowDist end
+                        end
                     end
+                    if bb then NPC_ESP.Billboards[model] = bb end
                 end
-                if bb then NPC_ESP.Billboards[model] = bb end
             end
         end
     end
@@ -2310,7 +2388,12 @@ local VisPage = AddNav("视觉", "visual")
 MakeLabel(VisPage, "== 玩家透视 ==")
 MakeToggle(VisPage, "透视玩家 (ESP)", false, function(v)
     Config.PlayerESP = v
-    if v then RefreshESP() else ClearAllPlayerESP() end
+    if v then
+        SetupPlayerJoinListeners()  -- 启动新玩家监听, 实时透视后加入的玩家
+        RefreshESP()
+    else
+        ClearAllPlayerESP()
+    end
     ShowNotification("玩家透视", v and "已开启" or "已关闭", v and Color3.fromRGB(100,180,100) or Color3.fromRGB(180,180,180))
 end)
 MakeToggle(VisPage, "团队检测 (队友不透视)", false, function(v)
@@ -2801,8 +2884,23 @@ function OpenWeaponWindow()
     local RefreshInfo  -- 前向声明 (ScanAllWeapons和RefreshInfo互相调用)
 
     -- 创建带冻结功能的滑块 (中文标签)
-    local function MakeWSlider(labelText, obj, minv, maxv, default, isBool)
-        if not obj then return end
+    -- obj: ValueBase实例(可能为nil)  field: 字段名(用于attr/prop回退写入)
+    local function MakeWSlider(labelText, obj, field, minv, maxv, default, isBool)
+        if default == nil then return end
+        -- 统一写入函数: 优先Value对象, 回退到attr/prop
+        local function writeVal(v)
+            pcall(function()
+                if obj and typeof(obj) == "Instance" and (obj:IsA("IntValue") or obj:IsA("NumberValue") or obj:IsA("BoolValue")) then
+                    obj.Value = v
+                else
+                    local key = Weapon[field.."Key"]; local kind = Weapon[field.."Kind"]
+                    if key and kind == "attr" then Weapon.Tool:SetAttribute(key, v)
+                    elseif key and kind == "prop" then Weapon.Tool[key] = v end
+                end
+            end)
+        end
+        -- 是否可冻结 (仅Value对象可冻结, attr/prop无对象引用无法循环强制写入)
+        local canFreeze = obj and typeof(obj) == "Instance" and (obj:IsA("IntValue") or obj:IsA("NumberValue") or obj:IsA("BoolValue"))
         local row = Instance.new("Frame")
         row.Size = UDim2.new(1, 0, 0, 56); row.BackgroundColor3 = Color3.fromRGB(15, 25, 15)
         row.ZIndex = 7; row.Parent = sliderHolder; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
@@ -2811,28 +2909,31 @@ function OpenWeaponWindow()
         lbl.BackgroundTransparency = 1; lbl.Text = labelText .. ": " .. tostring(default)
         lbl.TextColor3 = Color3.fromRGB(180, 255, 180); lbl.Font = Enum.Font.Code; lbl.TextSize = 11
         lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 8; lbl.Parent = row
-        -- 冻结按钮
-        local freezeBtn = Instance.new("TextButton")
-        freezeBtn.Size = UDim2.new(0, 56, 0, 20); freezeBtn.Position = UDim2.new(1, -62, 0, 4)
-        freezeBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 20); freezeBtn.Text = "冻结"
-        freezeBtn.TextColor3 = Color3.fromRGB(255, 200, 80); freezeBtn.Font = Enum.Font.Code; freezeBtn.TextSize = 10
-        freezeBtn.ZIndex = 8; freezeBtn.Parent = row; Instance.new("UICorner", freezeBtn).CornerRadius = UDim.new(0, 4)
+        -- 冻结按钮 (仅Value对象可冻结)
+        local freezeBtn
         local frozen = false
         local curVal = default
-        freezeBtn.MouseButton1Click:Connect(function()
-            frozen = not frozen
-            if frozen then
-                FreezeWeaponValue(obj, curVal)
-                freezeBtn.Text = "已冻结"
-                freezeBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
-                freezeBtn.TextColor3 = Color3.fromRGB(255,255,255)
-            else
-                UnfreezeWeaponValue(obj)
-                freezeBtn.Text = "冻结"
-                freezeBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 20)
-                freezeBtn.TextColor3 = Color3.fromRGB(255, 200, 80)
-            end
-        end)
+        if canFreeze then
+            freezeBtn = Instance.new("TextButton")
+            freezeBtn.Size = UDim2.new(0, 56, 0, 20); freezeBtn.Position = UDim2.new(1, -62, 0, 4)
+            freezeBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 20); freezeBtn.Text = "冻结"
+            freezeBtn.TextColor3 = Color3.fromRGB(255, 200, 80); freezeBtn.Font = Enum.Font.Code; freezeBtn.TextSize = 10
+            freezeBtn.ZIndex = 8; freezeBtn.Parent = row; Instance.new("UICorner", freezeBtn).CornerRadius = UDim.new(0, 4)
+            freezeBtn.MouseButton1Click:Connect(function()
+                frozen = not frozen
+                if frozen then
+                    FreezeWeaponValue(obj, curVal)
+                    freezeBtn.Text = "已冻结"
+                    freezeBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+                    freezeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+                else
+                    UnfreezeWeaponValue(obj)
+                    freezeBtn.Text = "冻结"
+                    freezeBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 20)
+                    freezeBtn.TextColor3 = Color3.fromRGB(255, 200, 80)
+                end
+            end)
+        end
         if isBool then
             -- 布尔值用切换按钮
             local togBtn = Instance.new("TextButton")
@@ -2843,13 +2944,11 @@ function OpenWeaponWindow()
             togBtn.ZIndex = 8; togBtn.Parent = row; Instance.new("UICorner", togBtn).CornerRadius = UDim.new(0, 4)
             togBtn.MouseButton1Click:Connect(function()
                 curVal = not curVal
-                pcall(function()
-                    if obj:IsA("BoolValue") then obj.Value = curVal end
-                end)
+                writeVal(curVal)
                 togBtn.BackgroundColor3 = curVal and Color3.fromRGB(40, 100, 40) or Color3.fromRGB(80, 30, 30)
                 togBtn.Text = curVal and "开启 (点击关闭)" or "关闭 (点击开启)"
                 lbl.Text = labelText .. ": " .. tostring(curVal)
-                if frozen then FreezeWeaponValue(obj, curVal) end
+                if frozen and canFreeze then FreezeWeaponValue(obj, curVal) end
             end)
         else
             -- 数值滑块
@@ -2867,10 +2966,8 @@ function OpenWeaponWindow()
                 curVal = minv + (maxv-minv)*r
                 fill.Size = UDim2.new(r, 0, 1, 0)
                 lbl.Text = labelText .. ": " .. string.format("%.2f", curVal)
-                pcall(function()
-                    if obj:IsA("IntValue") or obj:IsA("NumberValue") then obj.Value = curVal end
-                end)
-                if frozen then FreezeWeaponValue(obj, curVal) end
+                writeVal(curVal)
+                if frozen and canFreeze then FreezeWeaponValue(obj, curVal) end
             end
             slider.MouseButton1Down:Connect(function() dragging = true; upd(UserInputService:GetMouseLocation().X) end)
             slider.InputBegan:Connect(function(i)
@@ -2924,9 +3021,10 @@ function OpenWeaponWindow()
             Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
             btn.MouseButton1Click:Connect(function()
                 selectedTool = t
-                -- 装备该工具
-                pcall(function() t.Parent = char end)
-                DetectWeapon()
+                -- 直接检测该武器属性 (无需装备也能读取, 解决"背包武器检测不到"问题)
+                DetectWeapon(t)
+                -- 同时尝试装备 (部分游戏需要装备后修改才生效)
+                pcall(function() if char then t.Parent = char end end)
                 RefreshInfo()
             end)
         end
@@ -2960,27 +3058,27 @@ function OpenWeaponWindow()
         if Weapon.Values.ReloadTime then info = info .. "\n换弹时间: " .. Weapon.Values.ReloadTime end
         if Weapon.Values.Auto ~= nil then info = info .. "\n全自动模式: " .. tostring(Weapon.Values.Auto) end
         infoLbl.Text = info
-        -- 清空并重建滑块 (中文标签)
+        -- 清空并重建滑块 (中文标签) — 改为检查Values, 支持attr/prop类型
         for _, c in ipairs(sliderHolder:GetChildren()) do
             if c:IsA("Frame") then c:Destroy() end
         end
-        if Weapon.Ammo and Weapon.Values.Ammo then
-            MakeWSlider("子弹数量", Weapon.Ammo, 0, math.max(Weapon.Values.MaxAmmo or 30, Weapon.Values.Ammo)*2, Weapon.Values.Ammo, false)
+        if Weapon.Values.Ammo ~= nil then
+            MakeWSlider("子弹数量", Weapon.Ammo, "Ammo", 0, math.max(Weapon.Values.MaxAmmo or 30, Weapon.Values.Ammo or 30)*2, Weapon.Values.Ammo, false)
         end
-        if Weapon.MaxAmmo and Weapon.Values.MaxAmmo then
-            MakeWSlider("子弹上限", Weapon.MaxAmmo, 0, math.max(Weapon.Values.MaxAmmo*2, 100), Weapon.Values.MaxAmmo, false)
+        if Weapon.Values.MaxAmmo ~= nil then
+            MakeWSlider("子弹上限", Weapon.MaxAmmo, "MaxAmmo", 0, math.max(Weapon.Values.MaxAmmo*2, 100), Weapon.Values.MaxAmmo, false)
         end
-        if Weapon.Reserve and Weapon.Values.Reserve then
-            MakeWSlider("备弹数量", Weapon.Reserve, 0, math.max(Weapon.Values.Reserve*2, 100), Weapon.Values.Reserve, false)
+        if Weapon.Values.Reserve ~= nil then
+            MakeWSlider("备弹数量", Weapon.Reserve, "Reserve", 0, math.max((Weapon.Values.Reserve or 0)*2, 100), Weapon.Values.Reserve, false)
         end
-        if Weapon.FireRate and Weapon.Values.FireRate then
-            MakeWSlider("射击间隔", Weapon.FireRate, 0, math.max(Weapon.Values.FireRate*2, 1), Weapon.Values.FireRate, false)
+        if Weapon.Values.FireRate ~= nil then
+            MakeWSlider("射击间隔", Weapon.FireRate, "FireRate", 0, math.max(Weapon.Values.FireRate*2, 1), Weapon.Values.FireRate, false)
         end
-        if Weapon.ReloadTime and Weapon.Values.ReloadTime then
-            MakeWSlider("换弹时间", Weapon.ReloadTime, 0, math.max(Weapon.Values.ReloadTime*2, 5), Weapon.Values.ReloadTime, false)
+        if Weapon.Values.ReloadTime ~= nil then
+            MakeWSlider("换弹时间", Weapon.ReloadTime, "ReloadTime", 0, math.max(Weapon.Values.ReloadTime*2, 5), Weapon.Values.ReloadTime, false)
         end
-        if Weapon.Auto and Weapon.Values.Auto ~= nil then
-            MakeWSlider("全自动开火", Weapon.Auto, nil, nil, Weapon.Values.Auto, true)
+        if Weapon.Values.Auto ~= nil then
+            MakeWSlider("全自动开火", Weapon.Auto, "Auto", nil, nil, Weapon.Values.Auto, true)
         end
     end
     detBtn.MouseButton1Click:Connect(RefreshInfo)
@@ -3476,18 +3574,44 @@ end)
 MakeSlider(CmbPage, "预判百分比 (0~100, 100=完美)", 0, 100, 80, 1, function(v) Config.CombatPredictPercent = v end)
 MakeSlider(CmbPage, "子弹速度 (50~2000, 远程武器预判用)", 50, 2000, 500, 10, function(v) Config.CombatBulletSpeed = v end)
 MakeLabel(CmbPage, "== 锁定目标 ==")
-local lockModeBtn = MakeButton(CmbPage, "锁定模式: 全部 (点击切换)", function()
-    Config.CombatLockMode = (Config.CombatLockMode or 1) % 3 + 1
-    local names = {[1]="全部", [2]="仅玩家", [3]="仅NPC"}
-    Combat.Target = nil
-    lockModeBtn.Text = "锁定模式: " .. names[Config.CombatLockMode] .. " (点击切换)"
-    ShowNotification("锁定模式", "已切换为: " .. names[Config.CombatLockMode], Color3.fromRGB(100,220,180))
+-- 锁定模式切换按钮 (前向声明+单独Connect, 避免自引用问题)
+local lockModeBtn = Instance.new("TextButton")
+lockModeBtn.Size = UDim2.new(1, 0, 0, 36)
+lockModeBtn.BackgroundColor3 = Color3.fromRGB(60, 90, 160)
+lockModeBtn.Text = "锁定模式: 全部 (点击切换)"
+lockModeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+lockModeBtn.Font = Enum.Font.GothamBold
+lockModeBtn.TextSize = 13
+lockModeBtn.Parent = CmbPage
+Instance.new("UICorner", lockModeBtn).CornerRadius = UDim.new(0, 8)
+lockModeBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        Config.CombatLockMode = ((Config.CombatLockMode or 1) % 3) + 1
+        local modeNames = {[1]="全部", [2]="仅玩家", [3]="仅NPC"}
+        if Combat then Combat.Target = nil end
+        local newName = modeNames[Config.CombatLockMode] or "未知"
+        lockModeBtn.Text = "锁定模式: " .. newName .. " (点击切换)"
+        ShowNotification("锁定模式", "已切换为: " .. newName, Color3.fromRGB(100,220,180))
+    end)
 end)
-local lockPartBtn = MakeButton(CmbPage, "锁定部位: 身体 (点击切换)", function()
-    Config.CombatLockPart = (Config.CombatLockPart or 1) % 2 + 1
-    local names = {[1]="身体", [2]="头部"}
-    lockPartBtn.Text = "锁定部位: " .. names[Config.CombatLockPart] .. " (点击切换)"
-    ShowNotification("锁定部位", "已切换为: " .. names[Config.CombatLockPart], Color3.fromRGB(100,220,180))
+-- 锁定部位切换按钮 (前向声明+单独Connect, 避免自引用问题)
+local lockPartBtn = Instance.new("TextButton")
+lockPartBtn.Size = UDim2.new(1, 0, 0, 36)
+lockPartBtn.BackgroundColor3 = Color3.fromRGB(60, 90, 160)
+lockPartBtn.Text = "锁定部位: 身体 (点击切换)"
+lockPartBtn.TextColor3 = Color3.fromRGB(255,255,255)
+lockPartBtn.Font = Enum.Font.GothamBold
+lockPartBtn.TextSize = 13
+lockPartBtn.Parent = CmbPage
+Instance.new("UICorner", lockPartBtn).CornerRadius = UDim.new(0, 8)
+lockPartBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        Config.CombatLockPart = ((Config.CombatLockPart or 1) % 2) + 1
+        local partNames = {[1]="身体", [2]="头部"}
+        local newName = partNames[Config.CombatLockPart] or "未知"
+        lockPartBtn.Text = "锁定部位: " .. newName .. " (点击切换)"
+        ShowNotification("锁定部位", "已切换为: " .. newName, Color3.fromRGB(100,220,180))
+    end)
 end)
 MakeLabel(CmbPage, "== 锁定显示 ==")
 MakeButton(CmbPage, "调节锁定方框颜色", function()
@@ -3926,112 +4050,137 @@ Weapon = {  -- 赋值给前面前向声明的 local Weapon
     Frozen = {},  -- 冻结数值表 (key=属性对象, value=冻结目标值)
 }
 
--- 检测当前装备的武器 (遍历Backpack和Character里的Tool)
-DetectWeapon = function()  -- 赋值给前向声明的 local DetectWeapon
+-- 检测武器 (可传tool参数直接检测指定武器, 不传则检测手持武器)
+-- 递归搜索Value对象 + Attributes + 属性, 兼容各种枪械系统
+DetectWeapon = function(toolOverride)  -- 赋值给前向声明的 local DetectWeapon
     Weapon.Detected = false; Weapon.Tool = nil; Weapon.Name = ""
     Weapon.Ammo = nil; Weapon.MaxAmmo = nil; Weapon.Reserve = nil; Weapon.MaxReserve = nil
     Weapon.FireRate = nil; Weapon.ReloadTime = nil; Weapon.Auto = nil
     Weapon.Values = {}
-    local char = LocalPlayer.Character
-    if not char then return end
-    local tool = char:FindFirstChildOfClass("Tool")
-    if not tool then return end
+    local tool = toolOverride
+    if not tool then
+        local char = LocalPlayer.Character
+        if not char then return end
+        tool = char:FindFirstChildOfClass("Tool")
+    end
+    if not tool or not tool:IsA("Tool") then return end
     Weapon.Tool = tool
     Weapon.Name = tool.Name
     Weapon.Detected = true
-    -- 通用属性名检测 (兼容各种枪械系统)
-    local attrs = {
-        {"Ammo", "MaxAmmo", "ammo", "maxAmmo", "CurrentAmmo", "MagSize", "Magazine", "Clip"},
-        {"Reserve", "MaxReserve", "reserve", "maxReserve", "BackupAmmo", "StoredAmmo", "TotalAmmo"},
-        {"FireRate", "FireDelay", "fireRate", "Cooldown", "ShootCooldown", "AttackSpeed"},
-        {"ReloadTime", "reloadTime", "ReloadDuration"},
-        {"Automatic", "Auto", "IsAutomatic", "FullAuto", "automatic"},
-    }
-    local function findAttr(names)
-        for _, n in ipairs(names) do
-            if tool:FindFirstChild(n) then
-                local v = tool[n]
-                if v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("BoolValue") then return v end
-            end
-            local ok, val = pcall(function() return tool[n] end)
-            if ok and type(val) == "number" then return val end
+
+    -- 属性同义词表 (大幅扩充, 覆盖主流FPS框架: ACS, FE Gun Kit, CAS, ACS2, Custom等)
+    local ammoNames = {"Ammo","ammo","CurrentAmmo","Magazine","Clip","Mag","AmmoInMag","BulletCount","MagAmmo","LoadedAmmo","Rounds","Chambered"}
+    local maxAmmoNames = {"MaxAmmo","maxAmmo","MagSize","MagazineSize","MaxMag","MaxClip","MagCapacity","ClipSize","MaxMagazine","MagMax","Capacity"}
+    local reserveNames = {"Reserve","reserve","BackupAmmo","StoredAmmo","TotalAmmo","AmmoReserve","ReserveAmmo","SpareAmmo","ExtraAmmo","Backup"}
+    local maxReserveNames = {"MaxReserve","maxReserve","MaxBackup","MaxStored","MaxTotal","MaxReserveAmmo","MaxSpare"}
+    local fireRateNames = {"FireRate","FireDelay","fireRate","Cooldown","ShootCooldown","AttackSpeed","FireCooldown","Delay","ShotDelay","FireInterval","RateOfFire"}
+    local reloadNames = {"ReloadTime","reloadTime","ReloadDuration","Reload","ReloadSpeed","ReloadLength"}
+    local autoNames = {"Automatic","Auto","IsAutomatic","FullAuto","automatic","AutoFire","IsAuto","FullAutoMode"}
+
+    -- 检测 Roblox Instance Attributes (很多新游戏用SetAttribute)
+    local attrCache = nil
+    local function getAttr(name)
+        if attrCache == nil then
+            local ok, t = pcall(function() return tool:GetAttributes() end)
+            attrCache = ok and t or {}
         end
-        return nil
+        return attrCache[name]
     end
-    -- 检测属性 (Value对象 或 属性)
-    local ammoNames = {"Ammo","ammo","CurrentAmmo","Magazine","Clip","Mag"}
-    local maxAmmoNames = {"MaxAmmo","maxAmmo","MagSize","MagazineSize","MaxMag","MaxClip"}
-    local reserveNames = {"Reserve","reserve","BackupAmmo","StoredAmmo","TotalAmmo","AmmoReserve"}
-    local maxReserveNames = {"MaxReserve","maxReserve","MaxBackup","MaxStored","MaxTotal"}
-    local fireRateNames = {"FireRate","FireDelay","fireRate","Cooldown","ShootCooldown","AttackSpeed","FireCooldown"}
-    local reloadNames = {"ReloadTime","reloadTime","ReloadDuration"}
-    local autoNames = {"Automatic","Auto","IsAutomatic","FullAuto","automatic"}
+    -- 统一查找: Value对象 > Attributes > Tool属性
+    -- 返回: obj(ValueBase或nil), val(当前值或nil), kind("value"/"attr"/"prop"/nil), key(属性名或nil)
     local function findVal(names, isBool)
+        -- 1. ValueBase对象 (递归搜索子文件夹)
         for _, n in ipairs(names) do
-            local child = tool:FindFirstChild(n)
+            local child = tool:FindFirstChild(n, true)
             if child then
-                if isBool and child:IsA("BoolValue") then return child, child.Value end
-                if not isBool and (child:IsA("IntValue") or child:IsA("NumberValue")) then return child, child.Value end
-            end
-            local ok, v = pcall(function() return tool[n] end)
-            if ok then
-                if isBool and type(v) == "boolean" then return nil, v end
-                if not isBool and type(v) == "number" then return nil, v end
+                if isBool and child:IsA("BoolValue") then return child, child.Value, "value", n end
+                if not isBool and (child:IsA("IntValue") or child:IsA("NumberValue")) then return child, child.Value, "value", n end
             end
         end
-        return nil, nil
+        -- 2. Attributes
+        for _, n in ipairs(names) do
+            local v = getAttr(n)
+            if v ~= nil then
+                if isBool and type(v) == "boolean" then return nil, v, "attr", n end
+                if not isBool and type(v) == "number" then return nil, v, "attr", n end
+            end
+        end
+        -- 3. Tool属性
+        for _, n in ipairs(names) do
+            local ok, v = pcall(function() return tool[n] end)
+            if ok and v ~= nil then
+                if isBool and type(v) == "boolean" then return nil, v, "prop", n end
+                if not isBool and type(v) == "number" then return nil, v, "prop", n end
+            end
+        end
+        return nil, nil, nil, nil
     end
-    local aObj, aVal = findVal(ammoNames, false)
-    Weapon.Ammo = aObj; Weapon.Values.Ammo = aVal
-    local maObj, maVal = findVal(maxAmmoNames, false)
-    Weapon.MaxAmmo = maObj; Weapon.Values.MaxAmmo = maVal
-    local rObj, rVal = findVal(reserveNames, false)
-    Weapon.Reserve = rObj; Weapon.Values.Reserve = rVal
-    local mrObj, mrVal = findVal(maxReserveNames, false)
-    Weapon.MaxReserve = mrObj; Weapon.Values.MaxReserve = mrVal
-    local fObj, fVal = findVal(fireRateNames, false)
-    Weapon.FireRate = fObj; Weapon.Values.FireRate = fVal
-    local relObj, relVal = findVal(reloadNames, false)
-    Weapon.ReloadTime = relObj; Weapon.Values.ReloadTime = relVal
-    local autoObj, autoVal = findVal(autoNames, true)
-    Weapon.Auto = autoObj; Weapon.Values.Auto = autoVal
+
+    local aObj, aVal, aKind, aKey = findVal(ammoNames, false)
+    Weapon.Ammo = aObj; Weapon.Values.Ammo = aVal; Weapon.AmmoKind = aKind; Weapon.AmmoKey = aKey
+    local maObj, maVal, maKind, maKey = findVal(maxAmmoNames, false)
+    Weapon.MaxAmmo = maObj; Weapon.Values.MaxAmmo = maVal; Weapon.MaxAmmoKind = maKind; Weapon.MaxAmmoKey = maKey
+    local rObj, rVal, rKind, rKey = findVal(reserveNames, false)
+    Weapon.Reserve = rObj; Weapon.Values.Reserve = rVal; Weapon.ReserveKind = rKind; Weapon.ReserveKey = rKey
+    local mrObj, mrVal, mrKind, mrKey = findVal(maxReserveNames, false)
+    Weapon.MaxReserve = mrObj; Weapon.Values.MaxReserve = mrVal; Weapon.MaxReserveKind = mrKind; Weapon.MaxReserveKey = mrKey
+    local fObj, fVal, fKind, fKey = findVal(fireRateNames, false)
+    Weapon.FireRate = fObj; Weapon.Values.FireRate = fVal; Weapon.FireRateKind = fKind; Weapon.FireRateKey = fKey
+    local relObj, relVal, relKind, relKey = findVal(reloadNames, false)
+    Weapon.ReloadTime = relObj; Weapon.Values.ReloadTime = relVal; Weapon.ReloadTimeKind = relKind; Weapon.ReloadTimeKey = relKey
+    local autoObj, autoVal, autoKind, autoKey = findVal(autoNames, true)
+    Weapon.Auto = autoObj; Weapon.Values.Auto = autoVal; Weapon.AutoKind = autoKind; Weapon.AutoKey = autoKey
+end
+
+-- 读取武器属性当前值 (支持Value对象/Attribute/Property三种类型)
+-- field: "Ammo"/"MaxAmmo"/"Reserve"/"MaxReserve"/"FireRate"/"ReloadTime"/"Auto"
+local function ReadWeaponField(field)
+    local obj = Weapon[field]
+    if obj and typeof(obj) == "Instance" then
+        if obj:IsA("IntValue") or obj:IsA("NumberValue") then return obj.Value end
+        if obj:IsA("BoolValue") then return obj.Value end
+    end
+    -- attr / prop 路径: 用缓存的Values
+    return Weapon.Values and Weapon.Values[field]
+end
+-- 写入武器属性 (支持Value对象/Attribute/Property三种类型)
+local function WriteWeaponField(field, val)
+    local obj = Weapon[field]
+    if obj and typeof(obj) == "Instance" then
+        if obj:IsA("IntValue") or obj:IsA("NumberValue") or obj:IsA("BoolValue") then
+            obj.Value = val; return true
+        end
+    end
+    local key = Weapon[field.."Key"]
+    local kind = Weapon[field.."Kind"]
+    if not key or not kind then return false end
+    if kind == "attr" then
+        pcall(function() Weapon.Tool:SetAttribute(key, val) end)
+        return true
+    elseif kind == "prop" then
+        pcall(function() Weapon.Tool[key] = val end)
+        return true
+    end
+    return false
 end
 
 -- 无限子弹: 低于阈值时自动补满
 function WeaponInfAmmoTick()
     if not Weapon.Detected then return end
-    if not Weapon.Ammo or not Weapon.MaxAmmo then return end
+    if not Weapon.Values.Ammo or not Weapon.Values.MaxAmmo then return end
     local maxAmmo = Weapon.Values.MaxAmmo or 0
     if maxAmmo <= 0 then return end
-    local curAmmo = 0
-    if type(Weapon.Ammo) == "userdata" and Weapon.Ammo:IsA("IntValue") then
-        curAmmo = Weapon.Ammo.Value
-    else
-        local ok, v = pcall(function() return Weapon.Tool[Weapon.Ammo] end)
-        curAmmo = ok and v or 0
-    end
+    local curAmmo = ReadWeaponField("Ammo") or 0
     if curAmmo < Config.WeaponInfAmmoThreshold then
-        pcall(function()
-            if type(Weapon.Ammo) == "userdata" and Weapon.Ammo:IsA("IntValue") then
-                Weapon.Ammo.Value = maxAmmo
-            else
-                Weapon.Tool[Weapon.Ammo] = maxAmmo
-            end
-        end)
+        WriteWeaponField("Ammo", maxAmmo)
     end
 end
 
 -- 半自动转全自动
 local function ApplyAutoFire()
     if not Weapon.Detected then return end
-    if not Weapon.Auto then return end
-    pcall(function()
-        if type(Weapon.Auto) == "userdata" and Weapon.Auto:IsA("BoolValue") then
-            Weapon.Auto.Value = Config.WeaponAutoFire
-        else
-            Weapon.Tool[Weapon.Auto] = Config.WeaponAutoFire
-        end
-    end)
+    if Weapon.Values.Auto == nil then return end
+    WriteWeaponField("Auto", Config.WeaponAutoFire)
 end
 
 -- ============== 格斗系统 (自动面朝+视角锁定+预判) ==============
