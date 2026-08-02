@@ -2701,8 +2701,27 @@ local function ApplyFakeRagdoll()
             end
         end)
     else
-        -- 关闭: 恢复所有 Motor6D + 删除球窝关节 + 附件
+        -- 关闭: 恢复所有 Motor6D + 删除球窝关节 + 附件 + 抬HRP防卡地 + 重置相机Subject
         local char = LocalPlayer.Character
+        local hrp = GetHRP()
+        local hum = GetHum()
+        -- 1. 先抬人物防卡地: HRP 向上移 5 stud (如果在地面上, 避免恢复时一半身体陷地里)
+        if hrp and hum then
+            pcall(function()
+                -- 脚下射线判断是否接近地面, 是就往上抬一点
+                local rp = RaycastParams.new()
+                rp.FilterType = Enum.RaycastFilterType.Exclude
+                rp.FilterDescendantsInstances = {char or {}}
+                local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -3, 0), rp)
+                if hit then
+                    -- 接近地面, 往上抬 4.5 studs, 刚好到站立姿态
+                    hrp.CFrame = hrp.CFrame + Vector3.new(0, 4.5, 0)
+                else
+                    -- 悬空: 轻微抬一下防 Motor 重连时卡东西
+                    hrp.CFrame = hrp.CFrame + Vector3.new(0, 1, 0)
+                end
+            end)
+        end
         if char then
             pcall(function()
                 -- 删除我们创建的球窝关节和附件
@@ -2713,25 +2732,31 @@ local function ApplyFakeRagdoll()
                     end
                 end
             end)
-            -- 恢复 Motor6D
+            -- 恢复 Motor6D (Enabled 只在原始不是 nil 才设, 防 RootJoint 没存 Enabled 被设成 nil)
             for m, data in pairs(Fun.SavedMotors) do
                 pcall(function()
                     if m and m.Parent then
-                        m.Enabled = data.Enabled
+                        if type(data.Enabled) == "boolean" then m.Enabled = data.Enabled end
                         m.C0 = data.C0
                         m.C1 = data.C1
+                        m.Transform = CFrame.new()  -- 清零 Transform, 不残留任何转动 (防RootJoint残留85度躺平角度)
                     end
                 end)
             end
             Fun.SavedMotors = {}
         end
-        local hum = GetHum()
         if hum then
             hum.PlatformStand = false
             hum.AutoRotate = true
+            -- 重置相机 Subject, 防止视角跟着废 Part 掉到虚空
+            pcall(function()
+                Camera.CameraSubject = hum
+            end)
             hum:ChangeState(Enum.HumanoidStateType.GettingUp)
             task.delay(0.15, function()
-                if hum and hum.Parent then hum:ChangeState(Enum.HumanoidStateType.Running) end
+                if not hum or not hum.Parent then return end
+                pcall(function() Camera.CameraSubject = hum end)
+                hum:ChangeState(Enum.HumanoidStateType.Running)
             end)
         end
         ShowNotification("假布娃娃", "已关闭", Color3.fromRGB(180, 180, 180))
