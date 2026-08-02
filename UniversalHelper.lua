@@ -2524,12 +2524,25 @@ local function ApplyFakeRagdoll()
             end)
         end
         -- 搞笑爬行移动: WASD时给一个低矮的水平速度 + 小幅抖动 (像在地上拱)
+        -- 注意: 半空中不施加Y速度, 让重力正常下落, 避免悬空
         Fun.RagdollConn = RunService.Heartbeat:Connect(function(dt)
             if not Config.FakeRagdoll then return end
             local h = GetHRP(); local hum = GetHum()
             if not h or not hum then return end
             -- 持续保持趴下状态
             if hum.PlatformStand == false then hum.PlatformStand = true end
+            -- 检测是否着地 (向下射线 3 stud 内有碰撞物 = 着地)
+            local grounded = false
+            pcall(function()
+                local origin = h.Position
+                -- Workspace:Raycast 检测脚下 3 stud
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                local char = LocalPlayer.Character
+                params.FilterDescendantsInstances = char and {char} or {}
+                local result = Workspace:Raycast(origin, Vector3.new(0, -3, 0), params)
+                grounded = result ~= nil
+            end)
             local cam = Camera.CFrame
             local fwd = Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z)
             local right = Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z)
@@ -2540,23 +2553,38 @@ local function ApplyFakeRagdoll()
             if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= fwd end
             if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= right end
             if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += right end
-            if move.Magnitude > 0 then
-                move = move.Unit
-                local crawlSpeed = (Config.SpeedValue or 16) * 0.5  -- 爬行较慢
-                -- 搞笑抖动: Y轴小幅上下 + 随机左右扭动 (像在拱)
+            if grounded then
+                -- 着地: 爬行 + 搞笑抖动 (像在地上拱)
                 local wobble = math.sin(tick() * 10) * 2
                 local wobbleY = math.abs(math.sin(tick() * 8)) * 1.5
-                h.AssemblyLinearVelocity = Vector3.new(
-                    move.X * crawlSpeed + wobble * 0.3,
-                    wobbleY,
-                    move.Z * crawlSpeed + math.cos(tick() * 10) * 0.3
-                )
-                -- 身体小幅扭动 (带动四肢摆动)
-                h.AssemblyAngularVelocity = Vector3.new(0, wobble * 0.5, 0)
+                if move.Magnitude > 0 then
+                    move = move.Unit
+                    local crawlSpeed = (Config.SpeedValue or 16) * 0.5  -- 爬行较慢
+                    h.AssemblyLinearVelocity = Vector3.new(
+                        move.X * crawlSpeed + wobble * 0.3,
+                        wobbleY,
+                        move.Z * crawlSpeed + math.cos(tick() * 10) * 0.3
+                    )
+                    -- 身体小幅扭动 (带动四肢摆动)
+                    h.AssemblyAngularVelocity = Vector3.new(0, wobble * 0.5, 0)
+                else
+                    -- 静止时趴着不动 (水平阻尼, 保留Y轴物理)
+                    local cv = h.AssemblyLinearVelocity
+                    h.AssemblyLinearVelocity = Vector3.new(cv.X * 0.7, cv.Y, cv.Z * 0.7)
+                end
             else
-                -- 静止时趴着不动 (阻尼)
-                local cv = h.AssemblyLinearVelocity
-                h.AssemblyLinearVelocity = Vector3.new(cv.X * 0.7, cv.Y, cv.Z * 0.7)
+                -- 空中: 只施加水平方向移动, Y轴交给重力 (不悬空)
+                if move.Magnitude > 0 then
+                    move = move.Unit
+                    local crawlSpeed = (Config.SpeedValue or 16) * 0.4  -- 空中移动稍慢
+                    local cv = h.AssemblyLinearVelocity
+                    h.AssemblyLinearVelocity = Vector3.new(
+                        move.X * crawlSpeed,
+                        cv.Y,  -- 保留Y轴物理(重力下落)
+                        move.Z * crawlSpeed
+                    )
+                end
+                -- 空中不强制Y速度, 让自然下落
             end
         end)
     else
