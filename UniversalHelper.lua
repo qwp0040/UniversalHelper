@@ -338,17 +338,24 @@ local FX = {
     ScanConn = nil,
     PendingChildConn = {},-- 监听新特效产生的连接
     StatsCount = 0,
+    LoopToken = 0,        -- 协程令牌, 防止多个扫描协程同时运行
 }
+
+-- 安全读取 Instance 属性 (失败返回 nil)
+local function safeGet(obj, prop)
+    local ok, v = pcall(function() return obj[prop] end)
+    if ok then return v end
+    return nil
+end
 
 -- 判断对象是否属于本地玩家自己 (避免简化自己手持武器的特效)
 local function IsLocalPlayerOwned(obj)
     local p = obj
-    while p do
+    local depth = 0
+    while p and depth < 50 do  -- 深度限制防死循环
+        depth = depth + 1
         if p == LocalPlayer then return true end
-        local ok, isPlr = pcall(function() return p:IsA("Player") end)
-        if ok and isPlr and p == LocalPlayer then return true end
-        local ok2, parent = pcall(function() return p.Parent end)
-        if not ok2 then return false end
+        local parent = safeGet(p, "Parent")
         p = parent
     end
     return false
@@ -365,60 +372,89 @@ local function FXSave(obj, prop, newVal)
 end
 
 -- 处理单个特效对象 (内部实现, 由 FXProcess 用 pcall 包裹调用)
+-- 严格使用 safeGet 读取属性, 避免访问已失效对象抛错
 local function FXProcessInner(obj)
-    if not obj or not obj.Parent then return end
+    -- 用 pcall 检查有效性 (访问 .Parent 在已 Destroy 对象上会抛错)
+    local alive = false
+    pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+    if not alive then return end
     if FX.Originals[obj] then return end  -- 已处理过
     if IsLocalPlayerOwned(obj) then return end  -- 跳过本地玩家自身
 
-    local cls = obj.ClassName
+    local cls = safeGet(obj, "ClassName")
+    if not cls then return end
 
     if Config.FXSimplifyParticles and cls == "ParticleEmitter" then
-        -- 降低发射率 (Rate), 缩短生命周期, 降低速度
-        local origRate = obj.Rate
-        if origRate and origRate > 1 then
+        -- Rate: number 类型
+        local origRate = safeGet(obj, "Rate")
+        if type(origRate) == "number" and origRate > 1 then
             FXSave(obj, "Rate", math.max(0, math.floor(origRate * Config.FXParticleRate)))
         end
-        if obj.Lifetime then
-            local mn, mx = obj.Lifetime.Min, obj.Lifetime.Max
-            if mn and mx and mn >= 0 and mx >= 0 and mx >= mn then
-                FXSave(obj, "Lifetime", NumberSequence.new(mn * 0.7, mx * 0.7))
+        -- Lifetime: NumberRange 类型 (注意: 不是 NumberSequence!)
+        local lifetime = safeGet(obj, "Lifetime")
+        if lifetime and type(lifetime) == "table" then
+            local mn, mx = lifetime.Min, lifetime.Max
+            if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
+                FXSave(obj, "Lifetime", NumberRange.new(mn * 0.7, mx * 0.7))
             end
         end
-        if obj.Speed then
-            local mn, mx = obj.Speed.Min, obj.Speed.Max
-            if mn and mx and mn >= 0 and mx >= 0 and mx >= mn then
+        -- Speed: NumberRange 类型
+        local speed = safeGet(obj, "Speed")
+        if speed and type(speed) == "table" then
+            local mn, mx = speed.Min, speed.Max
+            if type(mn) == "number" and type(mx) == "number" and mn >= 0 and mx >= 0 and mx >= mn then
                 FXSave(obj, "Speed", NumberRange.new(mn * 0.5, mx * 0.5))
             end
         end
         FX.StatsCount = FX.StatsCount + 1
     elseif Config.FXSimplifyBeams and cls == "Beam" then
-        -- 提高透明度 (保留但更淡)
-        FXSave(obj, "Transparency", NumberSequence.new(Config.FXBeamTransparency))
-        if obj.Width0 and obj.Width0 > 0.1 then
-            FXSave(obj, "Width0", obj.Width0 * 0.5)
+        -- Transparency: NumberSequence 类型
+        local t = Config.FXBeamTransparency
+        if type(t) == "number" and t >= 0 and t <= 1 then
+            FXSave(obj, "Transparency", NumberSequence.new(t))
         end
-        if obj.Width1 and obj.Width1 > 0.1 then
-            FXSave(obj, "Width1", obj.Width1 * 0.5)
+        local w0 = safeGet(obj, "Width0")
+        if type(w0) == "number" and w0 > 0.1 then
+            FXSave(obj, "Width0", w0 * 0.5)
+        end
+        local w1 = safeGet(obj, "Width1")
+        if type(w1) == "number" and w1 > 0.1 then
+            FXSave(obj, "Width1", w1 * 0.5)
         end
         FX.StatsCount = FX.StatsCount + 1
     elseif Config.FXSimplifyTrails and cls == "Trail" then
-        FXSave(obj, "Transparency", NumberSequence.new(Config.FXTrailTransparency))
-        if obj.Lifetime and obj.Lifetime > 0.2 then
-            FXSave(obj, "Lifetime", obj.Lifetime * 0.6)
+        -- Transparency: NumberSequence 类型
+        local t = Config.FXTrailTransparency
+        if type(t) == "number" and t >= 0 and t <= 1 then
+            FXSave(obj, "Transparency", NumberSequence.new(t))
+        end
+        -- Lifetime: number 类型 (Trail 的 Lifetime 是 number, 不是 NumberRange)
+        local lt = safeGet(obj, "Lifetime")
+        if type(lt) == "number" and lt > 0.2 then
+            FXSave(obj, "Lifetime", lt * 0.6)
         end
         FX.StatsCount = FX.StatsCount + 1
     elseif Config.FXSimplifyDecals and (cls == "Decal" or cls == "Texture") then
-        -- 降低透明度而非删除
-        FXSave(obj, "Transparency", Config.FXDecalTransparency)
+        -- Transparency: number 类型
+        local t = Config.FXDecalTransparency
+        if type(t) == "number" and t >= 0 and t <= 1 then
+            FXSave(obj, "Transparency", t)
+        end
         FX.StatsCount = FX.StatsCount + 1
-    elseif Config.FXSimplifySmoke and (cls == "Smoke" or cls == "Fire" or cls == "Explosion" or cls == "Sparkles") then
-        -- 烟雾/火焰: 降低大小或不透明度
+    elseif Config.FXSimplifySmoke and (cls == "Smoke" or cls == "Fire" or cls == "Sparkles") then
+        -- 烟雾/火焰/火花: 降低大小或不透明度 (移除 Explosion, 它无这些属性且为瞬态)
         if cls == "Smoke" then
             FXSave(obj, "Opacity", 0.1)
-            if obj.Size then FXSave(obj, "Size", math.max(0.5, obj.Size * 0.3)) end
+            local sz = safeGet(obj, "Size")
+            if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
         elseif cls == "Fire" then
-            FXSave(obj, "Heat", math.max(0, obj.Heat * 0.2))
-            FXSave(obj, "Size", math.max(0.5, obj.Size * 0.3))
+            local heat = safeGet(obj, "Heat")
+            if type(heat) == "number" then FXSave(obj, "Heat", math.max(0, heat * 0.2)) end
+            local sz = safeGet(obj, "Size")
+            if type(sz) == "number" then FXSave(obj, "Size", math.max(0.5, sz * 0.3)) end
+        elseif cls == "Sparkles" then
+            -- Sparkles 用 Enabled 控制显示
+            FXSave(obj, "Enabled", false)
         end
         FX.StatsCount = FX.StatsCount + 1
     end
@@ -439,16 +475,31 @@ local function FXCollectContainers()
     end
 end
 
--- 慢速分批扫描协程
+-- 慢速分批扫描协程 (用 token 防止多个协程同时运行)
 local FX_MAX_QUEUE = 5000  -- 队列最大长度, 防止爆炸性增长导致扫描永不完
-local function FXScanLoop()
+-- 防止 Config.FXBatchSize/FXBatchInterval 为 nil 导致比较/wait 报错
+local function safeBatchSize()
+    local v = Config.FXBatchSize
+    if type(v) ~= "number" or v < 1 then return 2 end
+    return math.floor(v)
+end
+local function safeBatchInterval()
+    local v = Config.FXBatchInterval
+    if type(v) ~= "number" or v <= 0 then return 0.1 end
+    return v
+end
+
+local function FXScanLoop(myToken)
     local processedThisFrame = 0
-    while FX.Enabled do
+    while FX.Enabled and FX.LoopToken == myToken do
         processedThisFrame = 0
-        -- 处理队列里的容器, 每帧最多 Config.FXBatchSize 个对象
-        while processedThisFrame < Config.FXBatchSize and #FX.ProcessQueue > 0 do
+        local batchSize = safeBatchSize()
+        -- 处理队列里的容器, 每帧最多 batchSize 个对象
+        while processedThisFrame < batchSize and #FX.ProcessQueue > 0 do
+            -- 协程被停止则立即退出
+            if not FX.Enabled or FX.LoopToken ~= myToken then return end
             local container = table.remove(FX.ProcessQueue, 1)
-            -- 容器有效性检查 (pcall 保护, 避免访问失效对象的 Parent 抛错)
+            -- 容器有效性检查 (pcall 保护, 避免访问失效对象抛错)
             local valid = false
             pcall(function() valid = container ~= nil and container.Parent ~= nil end)
             if valid then
@@ -456,6 +507,7 @@ local function FXScanLoop()
                 pcall(function() children = container:GetChildren() end)
                 if children then
                     for _, child in ipairs(children) do
+                        if not FX.Enabled or FX.LoopToken ~= myToken then return end
                         -- 读取 ClassName (pcall 保护)
                         local ok, cls = pcall(function() return child.ClassName end)
                         if not ok then continue end
@@ -464,14 +516,15 @@ local function FXScanLoop()
                                 or cls == "Fire" or cls == "Sparkles") then
                             FXProcess(child)
                             processedThisFrame = processedThisFrame + 1
-                            if processedThisFrame >= Config.FXBatchSize then break end
+                            if processedThisFrame >= batchSize then break end
                         else
                             -- 能读到 ClassName 说明是 Instance, 非特效对象加入队列待展开
-                            -- 限制队列长度防止爆炸 (跳过 Camera/Terrain/Weld 等不可能含特效的对象)
+                            -- 限制队列长度防止爆炸 (跳过不可能含特效的对象)
                             if #FX.ProcessQueue < FX_MAX_QUEUE
                                and cls ~= "Camera" and cls ~= "Terrain"
                                and cls ~= "Weld" and cls ~= "WeldConstraint"
-                               and cls ~= "Motor6D" and cls ~= "Bone" then
+                               and cls ~= "Motor6D" and cls ~= "Bone"
+                               and cls ~= "Humanoid" and cls ~= "Animation" then
                                 table.insert(FX.ProcessQueue, child)
                             end
                         end
@@ -479,11 +532,11 @@ local function FXScanLoop()
                 end
             end
             -- 防死循环: 如果队列过长且都无新增, 让出
-            if processedThisFrame >= Config.FXBatchSize then break end
+            if processedThisFrame >= batchSize then break end
         end
-        task.wait(Config.FXBatchInterval)
+        task.wait(safeBatchInterval())
         -- 队列空了重新收集 (捕获新特效, 如新投出的烟雾弹)
-        if #FX.ProcessQueue == 0 and FX.Enabled then
+        if #FX.ProcessQueue == 0 and FX.Enabled and FX.LoopToken == myToken then
             FXCollectContainers()
             task.wait(2)  -- 每轮扫描间隔2秒, 慢速避免卡顿
         end
@@ -503,7 +556,7 @@ local function FXSetupListeners()
            or cls == "Decal" or cls == "Texture" or cls == "Smoke"
            or cls == "Fire" or cls == "Sparkles" then
             task.wait(0.2)  -- 等属性初始化
-            FXProcess(obj)
+            if FX.Enabled then FXProcess(obj) end
         end
     end)
     table.insert(FX.PendingChildConn, conn1)
@@ -520,28 +573,53 @@ local function StartFXSimplify()
     FX.Enabled = true
     FX.Originals = {}
     FX.StatsCount = 0
+    FX.LoopToken = FX.LoopToken + 1  -- 新令牌, 旧协程会自动退出
+    local myToken = FX.LoopToken
     FXCollectContainers()
     FXSetupListeners()
-    task.spawn(FXScanLoop)
+    -- 用 pcall 包裹整个协程, 防止任何未预期错误打印红字
+    task.spawn(function()
+        pcall(FXScanLoop, myToken)
+    end)
 end
 
--- 停止并还原所有特效
+-- 停止并还原所有特效 (全程 pcall 保护, 防止访问已销毁对象抛错)
 local function StopFXSimplify()
     FX.Enabled = false
+    FX.LoopToken = FX.LoopToken + 1  -- 令牌递增, 让扫描协程立即退出
     FXClearListeners()
-    -- 还原原值
+    FX.ProcessQueue = {}
+    -- 还原原值 (整个循环体用 pcall 保护, 避免访问已 Destroy 的 Instance 抛错)
     local restored = 0
-    for obj, props in pairs(FX.Originals) do
-        if obj and obj.Parent then
-            for prop, val in pairs(props) do
-                pcall(function() obj[prop] = val end)
-                restored = restored + 1
+    pcall(function()
+        for obj, props in pairs(FX.Originals) do
+            -- 检查对象是否仍有效 (pcall 保护 Parent 访问)
+            local alive = false
+            pcall(function() alive = obj ~= nil and obj.Parent ~= nil end)
+            if alive then
+                for prop, val in pairs(props) do
+                    pcall(function() obj[prop] = val end)
+                    restored = restored + 1
+                end
             end
         end
-    end
+    end)
     FX.Originals = {}
-    FX.ProcessQueue = {}
     return restored
+end
+
+-- 重启简化 (子开关切换后调用, 重新扫描以应用新设置)
+-- 全程 pcall 保护, 防止任何错误打印红字
+local function FXRestart()
+    task.spawn(function()
+        pcall(function()
+            if FX.Enabled then
+                StopFXSimplify()
+                task.wait(0.3)
+                if Config.FXSimplify then StartFXSimplify() end
+            end
+        end)
+    end)
 end
 
 -- ============== 玩家ESP (定时器驱动, 不用Heartbeat) ==============
@@ -3871,30 +3949,27 @@ end)
 MakeToggle(OptPage, "简化粒子发射器", true, function(v)
     Config.FXSimplifyParticles = v
     if not Config.FXSimplify then return end
-    -- 重新扫描以应用新设置
-    task.spawn(function()
-        StopFXSimplify(); task.wait(0.3); StartFXSimplify()
-    end)
+    FXRestart()
 end)
 MakeToggle(OptPage, "简化光束 (Beam)", true, function(v)
     Config.FXSimplifyBeams = v
     if not Config.FXSimplify then return end
-    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+    FXRestart()
 end)
 MakeToggle(OptPage, "简化拖尾 (Trail)", true, function(v)
     Config.FXSimplifyTrails = v
     if not Config.FXSimplify then return end
-    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+    FXRestart()
 end)
 MakeToggle(OptPage, "简化贴花 (Decal)", true, function(v)
     Config.FXSimplifyDecals = v
     if not Config.FXSimplify then return end
-    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+    FXRestart()
 end)
 MakeToggle(OptPage, "简化烟雾/火焰", true, function(v)
     Config.FXSimplifySmoke = v
     if not Config.FXSimplify then return end
-    task.spawn(function() StopFXSimplify(); task.wait(0.3); StartFXSimplify() end)
+    FXRestart()
 end)
 MakeLabel(OptPage, "== 强度调节 ==")
 MakeSlider(OptPage, "粒子保留比例 (越小越简化)", 0.01, 1.0, 0.15, 0.01, function(v)
