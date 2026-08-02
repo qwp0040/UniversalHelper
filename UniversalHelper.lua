@@ -2376,6 +2376,14 @@ local function ApplyHelicopterSpin()
                 Fun.SavedMotors[m] = {C0 = m.C0, C1 = m.C1}
             end
         end
+        -- 【关键】开启时一次性记录当前人物基础YAW,之后只累加HeliAngle,不再每帧读相机
+        -- 之前每帧读Camera.CFrame的LookVector算yaw,相机平滑跟随导致yaw抖动,表现为人物面朝抽动
+        local initYaw = 0
+        if hrp then
+            local lk = hrp.CFrame.LookVector
+            initYaw = math.atan2(-lk.X, -lk.Z)
+        end
+        Fun.HeliBaseYaw = initYaw
         Fun.HeliAngle = 0
         Fun.HeliConn = RunService.Heartbeat:Connect(function(dt)
             if not Config.HelicopterSpin then return end
@@ -2395,7 +2403,7 @@ local function ApplyHelicopterSpin()
             end
             -- 旋转角度累加 (Y轴)
             Fun.HeliAngle = Fun.HeliAngle + (Config.HelicopterSpinSpeed or 18) * dt
-            -- 相机方向 (不锁定面朝方向, 朝镜头飞)
+            -- 相机方向 (只用于WASD移动方向输入, 不再决定人物面朝角度, 避免抖动)
             local cam = Camera.CFrame
             local fwd = Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z)
             local right = Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z)
@@ -2411,9 +2419,8 @@ local function ApplyHelicopterSpin()
             elseif UserInputService:IsKeyDown(Enum.KeyCode.Q) then yVel = -(Config.FlySpeed or 50) end
             -- 保持高度 + 移动 (用相机水平方向), 同时Y轴自转
             local pos = h.Position
-            -- 用相机朝向作为基础朝向 + Y轴自转 (直升机效果)
-            local camYaw = math.atan2(-cam.LookVector.X, -cam.LookVector.Z)
-            h.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + Fun.HeliAngle, 0)
+            -- 只用开启时的基础yaw + 累加旋转角, 不再每帧读相机, 彻底消除面朝抖动
+            h.CFrame = CFrame.new(pos) * CFrame.Angles(0, Fun.HeliBaseYaw + Fun.HeliAngle, 0)
             -- 速度
             if move.Magnitude > 0 then
                 move = move.Unit
@@ -2609,18 +2616,21 @@ local function ApplyFakeRagdoll()
             local h = GetHRP(); local hum = GetHum()
             local c = LocalPlayer.Character
             if not h or not hum then return end
-            -- 持续强制趴下状态 (每帧重设, 防游戏服务端覆盖 PlatformStand 导致又站起来)
+            -- 持续强制趴下状态 (每帧重设bool, 代价极低)
             if hum.PlatformStand == false then hum.PlatformStand = true end
             if hum.AutoRotate == true then hum.AutoRotate = false end
-            -- 直接旋转 RootJoint 让身体躺平 (绕X轴90度=趴下), 不依赖PlatformStand物理倒地
-            -- 这样即使游戏覆盖PlatformStand, 身体也会被强制趴下
-            if c then
-                local rj = FindRootJoint(c)
-                if rj and Fun.SavedMotors[rj] then
-                    pcall(function()
-                        rj.C0 = Fun.SavedMotors[rj].C0 * CFrame.Angles(math.rad(85), 0, 0)
-                        rj.Transform = CFrame.Angles(math.rad(85), 0, 0)
-                    end)
+            -- 强制躺平 RootJoint 旋转: 每0.2秒重设一次, 不每帧硬写C0(否则和物理打架抖动)
+            Fun._ragdollLayTick = (Fun._ragdollLayTick or 0) + dt
+            if Fun._ragdollLayTick > 0.2 then
+                Fun._ragdollLayTick = 0
+                if c then
+                    local rj = FindRootJoint(c)
+                    if rj and Fun.SavedMotors[rj] then
+                        pcall(function()
+                            rj.C0 = Fun.SavedMotors[rj].C0 * CFrame.Angles(math.rad(85), 0, 0)
+                            rj.Transform = CFrame.Angles(math.rad(85), 0, 0)
+                        end)
+                    end
                 end
             end
             -- 周期性停止动画 (R15动画包可能重新播放, 把已禁用的Motor6D驱动起来)
