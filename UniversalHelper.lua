@@ -4364,16 +4364,26 @@ FloatBall.InputBegan:Connect(function(i)
     end
 end)
 FloatBall.InputChanged:Connect(function(i)
-    if fbDrag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+    if fbDrag and fbStart and fbPos and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
         local delta = i.Position - fbStart
         if delta.Magnitude > 5 then fbMoved = true end
-        FloatBall.Position = UDim2.new(0, fbPos.X.Offset + delta.X, 0, fbPos.Y.Offset + delta.Y)
+        -- 检查 FloatBall 仍有效
+        local alive = false
+        pcall(function() alive = FloatBall ~= nil and FloatBall.Parent ~= nil end)
+        if alive then
+            FloatBall.Position = UDim2.new(0, fbPos.X.Offset + delta.X, 0, fbPos.Y.Offset + delta.Y)
+        end
     end
 end)
 FloatBall.InputEnded:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-        fbDrag = false
-        if fbMoved then SaveFloatPos(FloatBall.Position) else OpenFromFloat() end
+        fbDrag = false; fbStart = nil
+        -- 检查 FloatBall 仍有效
+        local alive = false
+        pcall(function() alive = FloatBall ~= nil and FloatBall.Parent ~= nil end)
+        if alive then
+            if fbMoved then SaveFloatPos(FloatBall.Position) else OpenFromFloat() end
+        end
     end
 end)
 
@@ -4385,27 +4395,36 @@ TitleBar.InputBegan:Connect(function(i)
 end)
 TitleBar.InputEnded:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-        dragging = false; SaveUIPos(Main.Position)
+        dragging = false; dragStart = nil
+        if Main and Main.Parent then SaveUIPos(Main.Position) end
     end
 end)
 UserInputService.InputChanged:Connect(function(i)
-    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-        local delta = i.Position - dragStart
-        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
-                                    startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    -- 检查 dragging/dragStart/startPos 都有效, 防止 nil 算术报错
+    if dragging and dragStart and startPos
+       and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        -- 检查 Main 仍有效 (防止 GUI 销毁后访问抛错)
+        local mainAlive = false
+        pcall(function() mainAlive = Main ~= nil and Main.Parent ~= nil end)
+        if mainAlive then
+            local delta = i.Position - dragStart
+            Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                                        startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
     end
 end)
 
 Players.LocalPlayer.CharacterAdded:Connect(function()
     task.wait(1)
-    if Config.SpeedEnabled then ApplySpeed() end
-    if Config.JumpEnabled then ApplyJump() end
-    if Config.FlyEnabled then ApplyFly() end
-    if Config.TeleWalk then ApplyTeleWalk() end
-    if Config.Noclip then ApplyNoclip() end
-    if Config.InfiniteJump then ApplyInfiniteJump() end
-    if Config.FloatMode then ApplyFloat() end
-    if Config.GhostMode then ApplyGhostMode() end
+    -- 每个调用用 pcall 隔离, 防止某一个报错中断后续恢复
+    if Config.SpeedEnabled then pcall(ApplySpeed) end
+    if Config.JumpEnabled then pcall(ApplyJump) end
+    if Config.FlyEnabled then pcall(ApplyFly) end
+    if Config.TeleWalk then pcall(ApplyTeleWalk) end
+    if Config.Noclip then pcall(ApplyNoclip) end
+    if Config.InfiniteJump then pcall(ApplyInfiniteJump) end
+    if Config.FloatMode then pcall(ApplyFloat) end
+    if Config.GhostMode then pcall(ApplyGhostMode) end
 end)
 
 -- ============== 枪械检测/修改系统 ==============
