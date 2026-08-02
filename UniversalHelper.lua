@@ -2399,19 +2399,19 @@ local function ApplyHelicopterSpin()
     end
 end
 
--- 360度无死角旋转 (碰撞体积不变, 只旋转视觉CFrame)
+-- 360度无死角旋转 (三轴任意方向旋转, 碰撞体积不变, 只旋转视觉)
 local function ApplySpin360()
     if Fun.Spin360Conn then Fun.Spin360Conn:Disconnect() Fun.Spin360Conn=nil end
     if Config.Spin360 then
-        ShowNotification("360旋转", "已开启 (碰撞体积不变)", Color3.fromRGB(255, 200, 80))
+        ShowNotification("360旋转", "已开启 (三轴任意方向旋转, 碰撞体积不变)", Color3.fromRGB(255, 200, 80))
         Fun.Spin360Angle = 0
+        -- 用于三轴不同速度的相位偏移, 让旋转方向不固定
         Fun.Spin360Conn = RunService.Heartbeat:Connect(function(dt)
             if not Config.Spin360 then return end
             local h = GetHRP(); if not h then return end
             Fun.Spin360Angle = Fun.Spin360Angle + (Config.Spin360Speed or 10) * dt
-            -- 只改CFrame朝向, 不改Position (碰撞体积由物理引擎基于Size计算, 不受CFrame朝向影响)
-            -- 用 Orientation 方式叠加旋转, 但注意这会让人物翻滚; 为保持碰撞不变, 我们只旋转 RootJoint 的 C0
-            -- 更稳妥: 旋转 HumanoidRootPart 的 RootJoint (连接 Torso), 这样 HRP 朝向不变(碰撞不变), 身体视觉旋转
+            -- 三轴旋转: X/Y/Z 各以不同倍率旋转, 实现任意方向无死角翻滚
+            -- 通过旋转 RootJoint 的 C0 (HRP朝向不变=碰撞不变, 身体视觉翻滚)
             local char = LocalPlayer.Character
             if not char then return end
             local rootJoint = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("RootJoint") or
@@ -2422,12 +2422,16 @@ local function ApplySpin360()
                     Fun.SavedMotors[rootJoint] = {C0 = rootJoint.C0, C1 = rootJoint.C1}
                 end
                 pcall(function()
-                    rootJoint.C0 = Fun.SavedMotors[rootJoint].C0 * CFrame.Angles(0, Fun.Spin360Angle, 0)
+                    -- X/Y/Z 三轴叠加, 倍率不同让旋转方向不重复 (无死角)
+                    local ang = Fun.Spin360Angle
+                    rootJoint.C0 = Fun.SavedMotors[rootJoint].C0
+                        * CFrame.Angles(ang,        ang * 0.7,  ang * 1.3)
                 end)
             else
-                -- 兜底: 直接旋转 HRP (但会改变碰撞朝向, 仅在找不到 RootJoint 时)
+                -- 兜底: 直接旋转 HRP (会改变碰撞朝向, 仅在找不到 RootJoint 时)
                 local pos = h.Position
-                h.CFrame = CFrame.new(pos) * CFrame.Angles(0, Fun.Spin360Angle, 0)
+                local ang = Fun.Spin360Angle
+                h.CFrame = CFrame.new(pos) * CFrame.Angles(ang, ang * 0.7, ang * 1.3)
             end
         end)
     else
@@ -2446,25 +2450,76 @@ local function ApplySpin360()
     end
 end
 
--- 假布娃娃: 自然倒地 + 名字跟随 + 搞笑爬行移动
+-- 假布娃娃: 自然倒地 + 四肢身体瘫软 + 名字跟随 + 搞笑爬行移动
+-- 实现: 用 BallSocketConstraint 替换所有 Motor6D, 让四肢和身体各部分自由摆动瘫软
+local function FindCharMotors(char)
+    local list = {}
+    pcall(function()
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("Motor6D") then
+                local n = d.Name:lower()
+                -- 排除 Root 关节 (保持 HRP 与身体的连接, 否则身体会脱离)
+                if n ~= "rootjoint" and n ~= "root" then
+                    table.insert(list, d)
+                end
+            end
+        end
+    end)
+    return list
+end
 local function ApplyFakeRagdoll()
     if Fun.RagdollConn then Fun.RagdollConn:Disconnect() Fun.RagdollConn=nil end
     if Config.FakeRagdoll then
-        ShowNotification("假布娃娃", "已开启 (瘫软倒地, 可爬行移动)", Color3.fromRGB(255, 200, 80))
+        ShowNotification("假布娃娃", "已开启 (四肢身体瘫软, 可爬行移动)", Color3.fromRGB(255, 200, 80))
+        local char = LocalPlayer.Character
         local hum = GetHum(); local hrp = GetHRP()
-        if hum then
+        if hum and char then
             if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
-            -- PlatformStand + 物理倒地 (碰撞体积改变, 名字Billboard会跟随 HRP/Torso)
+            -- PlatformStand + 物理倒地 (碰撞体积改变, 名字Billboard跟随身体)
             hum.PlatformStand = true
             hum.AutoRotate = false
             hum:ChangeState(Enum.HumanoidStateType.Physics)
+            -- 关键: 把所有 Motor6D (除RootJoint外) 用 BallSocketConstraint 替换, 让四肢身体瘫软
+            Fun.SavedMotors = {}
+            local motors = FindCharMotors(char)
+            for _, m in ipairs(motors) do
+                pcall(function()
+                    if not Fun.SavedMotors[m] then
+                        Fun.SavedMotors[m] = {C0 = m.C0, C1 = m.C1, Enabled = m.Enabled, Parent = m.Parent}
+                    end
+                    local part0 = m.Part0; local part1 = m.Part1
+                    if part0 and part1 then
+                        -- 禁用 Motor6D (保留实例用于恢复)
+                        m.Enabled = false
+                        -- 创建球窝关节 (BallSocketConstraint), 让连接处可自由旋转
+                        local att0 = Instance.new("Attachment")
+                        att0.Name = "RagdollAtt0"
+                        -- C0 是相对 Part0 的偏移
+                        att0.CFrame = m.C0
+                        att0.Parent = part0
+                        local att1 = Instance.new("Attachment")
+                        att1.Name = "RagdollAtt1"
+                        att1.CFrame = m.C1
+                        att1.Parent = part1
+                        local ball = Instance.new("BallSocketConstraint")
+                        ball.Name = "RagdollBall"
+                        ball.Attachment0 = att0
+                        ball.Attachment1 = att1
+                        -- 限制角度避免过度扭曲, 但足够瘫软
+                        ball.LimitsEnabled = true
+                        ball.TwistLimitsEnabled = true
+                        ball.UpperAngle = 80
+                        ball.TwistUpperAngle = 80
+                        -- 加点阻尼让瘫软更自然
+                        ball.Visible = false
+                        ball.Parent = part0
+                    end
+                end)
+            end
         end
-        -- 旋转身体使其躺平 (绕X轴90度, 像趴在地上)
         if hrp then
             pcall(function()
-                -- 用 CFrame 让人物趴下, 但保留位置; PlatformStand会接管物理
-                local pos = hrp.Position
-                -- 不直接设CFrame(会打架), 改为给一个初始倾倒力让自然倒地
+                -- 给一个初始倾倒力让自然倒地
                 hrp.AssemblyAngularVelocity = Vector3.new(5, 0, 0)
             end)
         end
@@ -2496,7 +2551,7 @@ local function ApplyFakeRagdoll()
                     wobbleY,
                     move.Z * crawlSpeed + math.cos(tick() * 10) * 0.3
                 )
-                -- 身体小幅扭动
+                -- 身体小幅扭动 (带动四肢摆动)
                 h.AssemblyAngularVelocity = Vector3.new(0, wobble * 0.5, 0)
             else
                 -- 静止时趴着不动 (阻尼)
@@ -2505,6 +2560,30 @@ local function ApplyFakeRagdoll()
             end
         end)
     else
+        -- 关闭: 恢复所有 Motor6D + 删除球窝关节 + 附件
+        local char = LocalPlayer.Character
+        if char then
+            pcall(function()
+                -- 删除我们创建的球窝关节和附件
+                for _, d in ipairs(char:GetDescendants()) do
+                    if (d:IsA("BallSocketConstraint") and d.Name == "RagdollBall")
+                       or (d:IsA("Attachment") and (d.Name == "RagdollAtt0" or d.Name == "RagdollAtt1")) then
+                        d:Destroy()
+                    end
+                end
+            end)
+            -- 恢复 Motor6D
+            for m, data in pairs(Fun.SavedMotors) do
+                pcall(function()
+                    if m and m.Parent then
+                        m.Enabled = data.Enabled
+                        m.C0 = data.C0
+                        m.C1 = data.C1
+                    end
+                end)
+            end
+            Fun.SavedMotors = {}
+        end
         local hum = GetHum()
         if hum then
             hum.PlatformStand = false
