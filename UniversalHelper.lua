@@ -101,6 +101,13 @@ local Config = {
     SSDisablePostEffects=true, -- 关闭后处理特效 (Bloom/ColorCorrection/SunRays/DepthOfField)
     SSAggressiveParticles=true,-- 激进粒子简化 (直接 Rate=0 而非降低)
 
+    -- 娱乐功能
+    HelicopterSpin=false,        -- 直升机旋转 (展开双臂+快速旋转+飞行)
+    HelicopterSpinSpeed=18,      -- 旋转速度 (弧度/秒)
+    Spin360=false,               -- 360度无死角旋转 (碰撞体积不变)
+    Spin360Speed=10,             -- 360旋转速度
+    FakeRagdoll=false,           -- 假布娃娃 (自然倒地+名字跟随+搞笑爬行)
+
 }
 
 local NotifyCfg = {
@@ -2276,6 +2283,238 @@ local function ApplyFly()
         end
         SavedFlyState = nil
         ShowNotification("飞行","已关闭",Color3.fromRGB(180,180,180))
+    end
+end
+
+-- ============== 娱乐功能 (直升机旋转 / 360旋转 / 假布娃娃) ==============
+local Fun = {
+    HeliConn=nil, HeliAngle=0,    -- 直升机
+    Spin360Conn=nil, Spin360Angle=0,  -- 360旋转
+    RagdollConn=nil,              -- 假布娃娃
+    -- 保存原始 Motor6D (用于手臂/身体恢复)
+    SavedMotors={}, SavedRagdollState=nil,
+}
+-- 找角色手臂关节 (兼容 R6/R15)
+local function FindArmMotors(char)
+    -- R6: Left Shoulder / Right Shoulder (在 HumanoidRootPart? 实际在 Torso)
+    -- R15: LeftShoulder / RightShoulder (在 UpperTorso)
+    local result = {}
+    pcall(function()
+        local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("HumanoidRootPart")
+        if torso then
+            for _, child in ipairs(torso:GetChildren()) do
+                if child:IsA("Motor6D") then
+                    local n = child.Name:lower()
+                    if n:find("shoulder") or n:find("arm") then
+                        table.insert(result, child)
+                    end
+                end
+            end
+        end
+    end)
+    return result
+end
+
+-- 直升机旋转: 展开双臂 + 快速旋转 + 飞行 (WASD移动, Q下降 E上升, 朝镜头方向飞)
+local function ApplyHelicopterSpin()
+    if Fun.HeliConn then Fun.HeliConn:Disconnect() Fun.HeliConn=nil end
+    if Config.HelicopterSpin then
+        ShowNotification("直升机旋转", "已开启 (自动开启飞行, WASD移动, Q下降E上升)", Color3.fromRGB(255, 200, 80))
+        -- 自动开启飞行 (但不调用 ApplyFly 避免它锁定面朝方向, 这里自管)
+        local hum = GetHum(); local hrp = GetHRP()
+        if hum then
+            if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
+            hum.PlatformStand = true
+            hum.AutoRotate = false
+        end
+        if hrp then hrp.AssemblyAngularVelocity = Vector3.zero end
+        -- 强制双臂展开 (旋转 Motor6D C0, 让手臂水平伸出)
+        local armsMotors = FindArmMotors(LocalPlayer.Character or {})
+        for _, m in ipairs(armsMotors) do
+            if not Fun.SavedMotors[m] then
+                Fun.SavedMotors[m] = {C0 = m.C0, C1 = m.C1}
+            end
+            -- 把肩膀关节旋转 90度, 让手臂水平展开
+            local isLeft = m.Name:lower():find("left") ~= nil
+            -- R6 Left Shoulder C0 默认 (-1, 0.5, 0.5) * R; 右肩 (1, 0.5, 0.5) * R
+            -- 这里直接旋转 C0 让手臂张开
+            pcall(function()
+                m.C0 = m.C0 * CFrame.Angles(0, 0, isLeft and math.rad(90) or math.rad(-90))
+            end)
+        end
+        Fun.HeliAngle = 0
+        Fun.HeliConn = RunService.Heartbeat:Connect(function(dt)
+            if not Config.HelicopterSpin then return end
+            local h = GetHRP(); local hum = GetHum()
+            if not h or not hum then return end
+            -- 旋转角度累加 (Y轴)
+            Fun.HeliAngle = Fun.HeliAngle + (Config.HelicopterSpinSpeed or 18) * dt
+            -- 相机方向 (不锁定面朝方向, 朝镜头飞)
+            local cam = Camera.CFrame
+            local fwd = Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z)
+            local right = Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z)
+            if fwd.Magnitude > 0.01 then fwd = fwd.Unit end
+            if right.Magnitude > 0.01 then right = right.Unit end
+            local move = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= right end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += right end
+            local yVel = 0
+            if UserInputService:IsKeyDown(Enum.KeyCode.E) then yVel = Config.FlySpeed or 50
+            elseif UserInputService:IsKeyDown(Enum.KeyCode.Q) then yVel = -(Config.FlySpeed or 50) end
+            -- 保持高度 + 移动 (用相机水平方向), 同时Y轴自转
+            local pos = h.Position
+            -- 用相机朝向作为基础朝向 + Y轴自转 (直升机效果)
+            local camYaw = math.atan2(-cam.LookVector.X, -cam.LookVector.Z)
+            h.CFrame = CFrame.new(pos) * CFrame.Angles(0, camYaw + Fun.HeliAngle, 0)
+            -- 速度
+            if move.Magnitude > 0 then
+                move = move.Unit
+                h.AssemblyLinearVelocity = Vector3.new(move.X * (Config.FlySpeed or 50), yVel, move.Z * (Config.FlySpeed or 50))
+            else
+                local cv = h.AssemblyLinearVelocity
+                h.AssemblyLinearVelocity = Vector3.new(cv.X * 0.85, yVel, cv.Z * 0.85)
+            end
+        end)
+    else
+        -- 关闭: 恢复手臂 + 飞行状态
+        local char = LocalPlayer.Character
+        if char then
+            for m, data in pairs(Fun.SavedMotors) do
+                pcall(function() if m and m.Parent then m.C0 = data.C0; m.C1 = data.C1 end end)
+            end
+        end
+        Fun.SavedMotors = {}
+        local hum = GetHum()
+        if hum then
+            hum.PlatformStand = false
+            hum.AutoRotate = true
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            task.delay(0.1, function()
+                if hum and hum.Parent then hum:ChangeState(Enum.HumanoidStateType.Running) end
+            end)
+        end
+        ShowNotification("直升机旋转", "已关闭", Color3.fromRGB(180, 180, 180))
+    end
+end
+
+-- 360度无死角旋转 (碰撞体积不变, 只旋转视觉CFrame)
+local function ApplySpin360()
+    if Fun.Spin360Conn then Fun.Spin360Conn:Disconnect() Fun.Spin360Conn=nil end
+    if Config.Spin360 then
+        ShowNotification("360旋转", "已开启 (碰撞体积不变)", Color3.fromRGB(255, 200, 80))
+        Fun.Spin360Angle = 0
+        Fun.Spin360Conn = RunService.Heartbeat:Connect(function(dt)
+            if not Config.Spin360 then return end
+            local h = GetHRP(); if not h then return end
+            Fun.Spin360Angle = Fun.Spin360Angle + (Config.Spin360Speed or 10) * dt
+            -- 只改CFrame朝向, 不改Position (碰撞体积由物理引擎基于Size计算, 不受CFrame朝向影响)
+            -- 用 Orientation 方式叠加旋转, 但注意这会让人物翻滚; 为保持碰撞不变, 我们只旋转 RootJoint 的 C0
+            -- 更稳妥: 旋转 HumanoidRootPart 的 RootJoint (连接 Torso), 这样 HRP 朝向不变(碰撞不变), 身体视觉旋转
+            local char = LocalPlayer.Character
+            if not char then return end
+            local rootJoint = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("RootJoint") or
+                              (char:FindFirstChild("LowerTorso") and char.LowerTorso:FindFirstChild("Root")) or
+                              (char:FindFirstChild("Torso") and char.Torso:FindFirstChild("RootJoint"))
+            if rootJoint then
+                if not Fun.SavedMotors[rootJoint] then
+                    Fun.SavedMotors[rootJoint] = {C0 = rootJoint.C0, C1 = rootJoint.C1}
+                end
+                pcall(function()
+                    rootJoint.C0 = Fun.SavedMotors[rootJoint].C0 * CFrame.Angles(0, Fun.Spin360Angle, 0)
+                end)
+            else
+                -- 兜底: 直接旋转 HRP (但会改变碰撞朝向, 仅在找不到 RootJoint 时)
+                local pos = h.Position
+                h.CFrame = CFrame.new(pos) * CFrame.Angles(0, Fun.Spin360Angle, 0)
+            end
+        end)
+    else
+        -- 恢复 RootJoint
+        local char = LocalPlayer.Character
+        if char then
+            local rootJoint = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("RootJoint") or
+                              (char:FindFirstChild("LowerTorso") and char.LowerTorso:FindFirstChild("Root")) or
+                              (char:FindFirstChild("Torso") and char.Torso:FindFirstChild("RootJoint"))
+            if rootJoint and Fun.SavedMotors[rootJoint] then
+                pcall(function() rootJoint.C0 = Fun.SavedMotors[rootJoint].C0; rootJoint.C1 = Fun.SavedMotors[rootJoint].C1 end)
+                Fun.SavedMotors[rootJoint] = nil
+            end
+        end
+        ShowNotification("360旋转", "已关闭", Color3.fromRGB(180, 180, 180))
+    end
+end
+
+-- 假布娃娃: 自然倒地 + 名字跟随 + 搞笑爬行移动
+local function ApplyFakeRagdoll()
+    if Fun.RagdollConn then Fun.RagdollConn:Disconnect() Fun.RagdollConn=nil end
+    if Config.FakeRagdoll then
+        ShowNotification("假布娃娃", "已开启 (瘫软倒地, 可爬行移动)", Color3.fromRGB(255, 200, 80))
+        local hum = GetHum(); local hrp = GetHRP()
+        if hum then
+            if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
+            -- PlatformStand + 物理倒地 (碰撞体积改变, 名字Billboard会跟随 HRP/Torso)
+            hum.PlatformStand = true
+            hum.AutoRotate = false
+            hum:ChangeState(Enum.HumanoidStateType.Physics)
+        end
+        -- 旋转身体使其躺平 (绕X轴90度, 像趴在地上)
+        if hrp then
+            pcall(function()
+                -- 用 CFrame 让人物趴下, 但保留位置; PlatformStand会接管物理
+                local pos = hrp.Position
+                -- 不直接设CFrame(会打架), 改为给一个初始倾倒力让自然倒地
+                hrp.AssemblyAngularVelocity = Vector3.new(5, 0, 0)
+            end)
+        end
+        -- 搞笑爬行移动: WASD时给一个低矮的水平速度 + 小幅抖动 (像在地上拱)
+        Fun.RagdollConn = RunService.Heartbeat:Connect(function(dt)
+            if not Config.FakeRagdoll then return end
+            local h = GetHRP(); local hum = GetHum()
+            if not h or not hum then return end
+            -- 持续保持趴下状态
+            if hum.PlatformStand == false then hum.PlatformStand = true end
+            local cam = Camera.CFrame
+            local fwd = Vector3.new(cam.LookVector.X, 0, cam.LookVector.Z)
+            local right = Vector3.new(cam.RightVector.X, 0, cam.RightVector.Z)
+            if fwd.Magnitude > 0.01 then fwd = fwd.Unit end
+            if right.Magnitude > 0.01 then right = right.Unit end
+            local move = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= fwd end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= right end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += right end
+            if move.Magnitude > 0 then
+                move = move.Unit
+                local crawlSpeed = (Config.SpeedValue or 16) * 0.5  -- 爬行较慢
+                -- 搞笑抖动: Y轴小幅上下 + 随机左右扭动 (像在拱)
+                local wobble = math.sin(tick() * 10) * 2
+                local wobbleY = math.abs(math.sin(tick() * 8)) * 1.5
+                h.AssemblyLinearVelocity = Vector3.new(
+                    move.X * crawlSpeed + wobble * 0.3,
+                    wobbleY,
+                    move.Z * crawlSpeed + math.cos(tick() * 10) * 0.3
+                )
+                -- 身体小幅扭动
+                h.AssemblyAngularVelocity = Vector3.new(0, wobble * 0.5, 0)
+            else
+                -- 静止时趴着不动 (阻尼)
+                local cv = h.AssemblyLinearVelocity
+                h.AssemblyLinearVelocity = Vector3.new(cv.X * 0.7, cv.Y, cv.Z * 0.7)
+            end
+        end)
+    else
+        local hum = GetHum()
+        if hum then
+            hum.PlatformStand = false
+            hum.AutoRotate = true
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            task.delay(0.15, function()
+                if hum and hum.Parent then hum:ChangeState(Enum.HumanoidStateType.Running) end
+            end)
+        end
+        ShowNotification("假布娃娃", "已关闭", Color3.fromRGB(180, 180, 180))
     end
 end
 
@@ -5178,6 +5417,40 @@ MakeToggle(CmbPage, "开启外出UI (小型同步UI)", false, function(v)
 end)
 end -- CmbPage 释放
 
+-- ============== 娱乐页 ==============
+do
+local FunPage = AddNav("娱乐", "fun")
+MakeLabel(FunPage, "== 直升机旋转 ==")
+MakeLabel(FunPage, "开启后展开双臂快速旋转 + 自动飞行, WASD移动, Q下降E上升")
+MakeToggle(FunPage, "直升机旋转", false, function(v)
+    Config.HelicopterSpin = v
+    ApplyHelicopterSpin()
+end)
+MakeSlider(FunPage, "旋转速度 (越大转越快)", 1, 50, 18, 1, function(v)
+    Config.HelicopterSpinSpeed = v
+end)
+MakeSlider(FunPage, "飞行速度 (直升机模式)", 0, 500, 50, 0.1, function(v)
+    Config.FlySpeed = v
+end)
+
+MakeLabel(FunPage, "== 360度无死角旋转 ==")
+MakeLabel(FunPage, "人物身体360度旋转, 碰撞体积不变")
+MakeToggle(FunPage, "360旋转", false, function(v)
+    Config.Spin360 = v
+    ApplySpin360()
+end)
+MakeSlider(FunPage, "360旋转速度", 1, 50, 10, 1, function(v)
+    Config.Spin360Speed = v
+end)
+
+MakeLabel(FunPage, "== 假布娃娃 ==")
+MakeLabel(FunPage, "自然倒地 + 名字跟随 + 可爬行移动 (搞笑拱地)")
+MakeToggle(FunPage, "假布娃娃", false, function(v)
+    Config.FakeRagdoll = v
+    ApplyFakeRagdoll()
+end)
+end -- FunPage 释放
+
 -- ============== 优化页 (服务器特效简化) ==============
 do
 local OptPage = AddNav("优化", "optimize")
@@ -5439,11 +5712,14 @@ MakeButton(SetPage, "关闭所有功能", function()
     Config.NPCESP=false; Config.SpeedEnabled=false; Config.JumpEnabled=false; Config.FlyEnabled=false
     Config.TeleWalk=false; Config.Noclip=false; Config.FastInteract=false; Config.InteractESP=false; Config.AutoRefresh=false
     Config.AutoInteract=false; Config.PureAutoInteract=false; Config.AutoModify=false; Config.AutoModifyMode=1
+    Config.HelicopterSpin=false; Config.Spin360=false; Config.FakeRagdoll=false
     Config.WallAutoRefresh=false; Config.InfiniteJump=false; Config.FloatMode=false; Config.GhostMode=false; Config.NPCKill=false
     ClearAllPlayerESP(); ClearAllNPCESP(); ClearInteractESP(); RestoreWallXray()
     if Xray.Conn then Xray.Conn:Disconnect(); Xray.Conn=nil end
     Xray.RefreshConn = nil
     pcall(StopAutoInteract); pcall(StopAutoDetect); pcall(StopPureAutoInteract); pcall(StopAutoModify)
+    Config.HelicopterSpin=false; Config.Spin360=false; Config.FakeRagdoll=false
+    pcall(ApplyHelicopterSpin); pcall(ApplySpin360); pcall(ApplyFakeRagdoll)
     ApplyNightVision(); ApplySpeed(); ApplyJump(); ApplyFly(); ApplyTeleWalk(); ApplyNoclip(); ApplyFastInteract()
     ApplyInfiniteJump(); ApplyFloat(); ApplyGhostMode()
     ShowNotification("设置", "已关闭所有功能", Color3.fromRGB(255, 100, 100))
@@ -5525,6 +5801,9 @@ MakeButton(SetPage, "销毁 UI (彻底关闭)", function()
         pcall(StopAutoDetect)
         pcall(StopPureAutoInteract)
         pcall(StopAutoModify)
+        -- 关闭娱乐功能
+        Config.HelicopterSpin=false; Config.Spin360=false; Config.FakeRagdoll=false
+        pcall(ApplyHelicopterSpin); pcall(ApplySpin360); pcall(ApplyFakeRagdoll)
         ApplyNightVision()
         local hum = GetHum()
         if hum then
@@ -5773,6 +6052,9 @@ Players.LocalPlayer.CharacterAdded:Connect(function()
     if Config.InfiniteJump then pcall(ApplyInfiniteJump) end
     if Config.FloatMode then pcall(ApplyFloat) end
     if Config.GhostMode then pcall(ApplyGhostMode) end
+    if Config.HelicopterSpin then pcall(ApplyHelicopterSpin) end
+    if Config.Spin360 then pcall(ApplySpin360) end
+    if Config.FakeRagdoll then pcall(ApplyFakeRagdoll) end
 end)
 
 -- ============== 枪械检测/修改系统 ==============
