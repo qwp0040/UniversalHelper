@@ -2505,12 +2505,28 @@ local function ApplyFakeRagdoll()
                         ball.Name = "RagdollBall"
                         ball.Attachment0 = att0
                         ball.Attachment1 = att1
-                        -- 限制角度避免过度扭曲, 但足够瘫软
+                        -- 参考Roblox标准布娃娃: 关节有合理角度限制, 不像之前80度那样散架
+                        -- 不同关节用不同限制: 肩/髋活动范围大, 肘/膝只能弯曲
+                        local jn = m.Name:lower()
+                        local upperAngle = 45      -- 默认45度 (Roblox常见)
+                        local twistUpper = 45
+                        if jn:find("shoulder") or jn:find("hip") then
+                            upperAngle = 60   -- 肩/髋范围更大
+                            twistUpper = 60
+                        elseif jn:find("knee") or jn:find("elbow") then
+                            upperAngle = 30   -- 肘/膝较小
+                            twistUpper = 20
+                        elseif jn:find("neck") then
+                            upperAngle = 35   -- 脖子
+                            twistUpper = 35
+                        elseif jn:find("waist") or jn:find("lower") or jn:find("upper") then
+                            upperAngle = 40
+                            twistUpper = 40
+                        end
                         ball.LimitsEnabled = true
                         ball.TwistLimitsEnabled = true
-                        ball.UpperAngle = 80
-                        ball.TwistUpperAngle = 80
-                        -- 加点阻尼让瘫软更自然
+                        ball.UpperAngle = upperAngle
+                        ball.TwistUpperAngle = twistUpper
                         ball.Visible = false
                         ball.Parent = part0
                     end
@@ -2554,21 +2570,22 @@ local function ApplyFakeRagdoll()
             if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= right end
             if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += right end
             if grounded then
-                -- 着地: 爬行 + 搞笑抖动 (像在地上拱)
-                local wobble = math.sin(tick() * 10) * 2
-                local wobbleY = math.abs(math.sin(tick() * 8)) * 1.5
+                -- 着地: 自然爬行 (轻微起伏, 不夸张)
+                local sway = math.sin(tick() * 6) * 0.8  -- 缓慢左右轻摆, 像爬行
                 if move.Magnitude > 0 then
                     move = move.Unit
-                    local crawlSpeed = (Config.SpeedValue or 16) * 0.5  -- 爬行较慢
+                    local crawlSpeed = (Config.SpeedValue or 16) * 0.35  -- 爬行较慢, 更真实
+                    -- 水平移动 + 轻微Y轴起伏 (爬行时的自然上下), 不夸张
+                    local cv = h.AssemblyLinearVelocity
                     h.AssemblyLinearVelocity = Vector3.new(
-                        move.X * crawlSpeed + wobble * 0.3,
-                        wobbleY,
-                        move.Z * crawlSpeed + math.cos(tick() * 10) * 0.3
+                        move.X * crawlSpeed + sway * 0.1,
+                        cv.Y,  -- 保留Y物理
+                        move.Z * crawlSpeed
                     )
-                    -- 身体小幅扭动 (带动四肢摆动)
-                    h.AssemblyAngularVelocity = Vector3.new(0, wobble * 0.5, 0)
+                    -- 身体轻微扭动 (像爬行时的自然摆动)
+                    h.AssemblyAngularVelocity = Vector3.new(0, sway * 0.2, 0)
                 else
-                    -- 静止时趴着不动 (水平阻尼, 保留Y轴物理)
+                    -- 静止时趴着不动 (阻尼, 保留Y轴物理)
                     local cv = h.AssemblyLinearVelocity
                     h.AssemblyLinearVelocity = Vector3.new(cv.X * 0.7, cv.Y, cv.Z * 0.7)
                 end
