@@ -2294,25 +2294,62 @@ local Fun = {
     -- 保存原始 Motor6D (用于手臂/身体恢复)
     SavedMotors={}, SavedRagdollState=nil,
 }
--- 找角色手臂关节 (兼容 R6/R15)
+-- 找角色手臂关节 (兼容 R6/R15, 递归查找防自定义骨架漏检)
 local function FindArmMotors(char)
-    -- R6: Left Shoulder / Right Shoulder (在 HumanoidRootPart? 实际在 Torso)
-    -- R15: LeftShoulder / RightShoulder (在 UpperTorso)
     local result = {}
     pcall(function()
-        local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("HumanoidRootPart")
-        if torso then
-            for _, child in ipairs(torso:GetChildren()) do
-                if child:IsA("Motor6D") then
-                    local n = child.Name:lower()
-                    if n:find("shoulder") or n:find("arm") then
-                        table.insert(result, child)
-                    end
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("Motor6D") then
+                local n = d.Name:lower()
+                if n:find("shoulder") or n == "leftshoulder" or n == "rightshoulder"
+                   or n:find("leftarm") or n:find("rightarm") then
+                    table.insert(result, d)
                 end
             end
         end
     end)
     return result
+end
+
+-- 找根关节 (R6: HumanoidRootPart.RootJoint; R15: HumanoidRootPart.RootJoint 或 LowerTorso.Root) 递归查找
+local function FindRootJoint(char)
+    local rj
+    pcall(function()
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            rj = hrp:FindFirstChild("RootJoint") or hrp:FindFirstChild("Root")
+        end
+        if not rj then
+            local lt = char:FindFirstChild("LowerTorso")
+            if lt then rj = lt:FindFirstChild("Root") or lt:FindFirstChild("RootJoint") end
+        end
+        if not rj then
+            local t = char:FindFirstChild("Torso")
+            if t then rj = t:FindFirstChild("RootJoint") or t:FindFirstChild("Root") end
+        end
+        -- 兜底: 全树找名为 RootJoint/Root 的 Motor6D
+        if not rj then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("Motor6D") then
+                    local n = d.Name:lower()
+                    if n == "rootjoint" or n == "root" then rj = d; break end
+                end
+            end
+        end
+    end)
+    return rj
+end
+
+-- 停止所有动画轨道 (防自定义动画包覆盖 Motor6D Transform)
+local function StopAllAnimations(hum)
+    pcall(function()
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                pcall(function() track:Stop(0) end)
+            end
+        end
+    end)
 end
 
 -- 直升机旋转: 展开双臂 + 快速旋转 + 飞行 (WASD移动, Q下降 E上升, 朝镜头方向飞)
@@ -2322,31 +2359,40 @@ local function ApplyHelicopterSpin()
         ShowNotification("直升机旋转", "已开启 (自动开启飞行, WASD移动, Q下降E上升)", Color3.fromRGB(255, 200, 80))
         -- 自动开启飞行 (但不调用 ApplyFly 避免它锁定面朝方向, 这里自管)
         local hum = GetHum(); local hrp = GetHRP()
+        local char = LocalPlayer.Character
         if hum then
             if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
             hum.PlatformStand = true
             hum.AutoRotate = false
+            -- 停止动画 (防动画包把手臂压下去)
+            StopAllAnimations(hum)
         end
         if hrp then hrp.AssemblyAngularVelocity = Vector3.zero end
-        -- 强制双臂展开 (旋转 Motor6D C0, 让手臂水平伸出)
-        local armsMotors = FindArmMotors(LocalPlayer.Character or {})
+        -- 保存手臂关节原始值 + 设置展开 (C0 持久偏移)
+        Fun.SavedMotors = Fun.SavedMotors or {}
+        local armsMotors = char and FindArmMotors(char) or {}
         for _, m in ipairs(armsMotors) do
             if not Fun.SavedMotors[m] then
                 Fun.SavedMotors[m] = {C0 = m.C0, C1 = m.C1}
             end
-            -- 把肩膀关节旋转 90度, 让手臂水平展开
-            local isLeft = m.Name:lower():find("left") ~= nil
-            -- R6 Left Shoulder C0 默认 (-1, 0.5, 0.5) * R; 右肩 (1, 0.5, 0.5) * R
-            -- 这里直接旋转 C0 让手臂张开
-            pcall(function()
-                m.C0 = m.C0 * CFrame.Angles(0, 0, isLeft and math.rad(90) or math.rad(-90))
-            end)
         end
         Fun.HeliAngle = 0
         Fun.HeliConn = RunService.Heartbeat:Connect(function(dt)
             if not Config.HelicopterSpin then return end
             local h = GetHRP(); local hum = GetHum()
+            local c = LocalPlayer.Character
             if not h or not hum then return end
+            -- 每帧停止动画 + 强制手臂展开 (覆盖动画包的 Transform, 确保手臂抬起)
+            if c then
+                local arms = FindArmMotors(c)
+                for _, m in ipairs(arms) do
+                    pcall(function()
+                        local isLeft = m.Name:lower():find("left") ~= nil
+                        -- Transform 每帧覆盖, 让手臂水平展开 (T-pose), 不被动画压下
+                        m.Transform = CFrame.Angles(0, 0, isLeft and math.rad(90) or math.rad(-90))
+                    end)
+                end
+            end
             -- 旋转角度累加 (Y轴)
             Fun.HeliAngle = Fun.HeliAngle + (Config.HelicopterSpinSpeed or 18) * dt
             -- 相机方向 (不锁定面朝方向, 朝镜头飞)
@@ -2404,19 +2450,20 @@ local function ApplySpin360()
     if Fun.Spin360Conn then Fun.Spin360Conn:Disconnect() Fun.Spin360Conn=nil end
     if Config.Spin360 then
         ShowNotification("360旋转", "已开启 (三轴任意方向旋转, 碰撞体积不变)", Color3.fromRGB(255, 200, 80))
+        -- 停止动画防动画包覆盖
+        local hum0 = GetHum(); if hum0 then StopAllAnimations(hum0) end
         Fun.Spin360Angle = 0
-        -- 用于三轴不同速度的相位偏移, 让旋转方向不固定
         Fun.Spin360Conn = RunService.Heartbeat:Connect(function(dt)
             if not Config.Spin360 then return end
             local h = GetHRP(); if not h then return end
             Fun.Spin360Angle = Fun.Spin360Angle + (Config.Spin360Speed or 10) * dt
-            -- 三轴旋转: X/Y/Z 各以不同倍率旋转, 实现任意方向无死角翻滚
-            -- 通过旋转 RootJoint 的 C0 (HRP朝向不变=碰撞不变, 身体视觉翻滚)
             local char = LocalPlayer.Character
             if not char then return end
-            local rootJoint = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("RootJoint") or
-                              (char:FindFirstChild("LowerTorso") and char.LowerTorso:FindFirstChild("Root")) or
-                              (char:FindFirstChild("Torso") and char.Torso:FindFirstChild("RootJoint"))
+            -- 周期性停止动画 (动画包可能重新播放)
+            if math.fmod(Fun.Spin360Angle, 3) < 0.1 then
+                local hum = GetHum(); if hum then StopAllAnimations(hum) end
+            end
+            local rootJoint = FindRootJoint(char)
             if rootJoint then
                 if not Fun.SavedMotors[rootJoint] then
                     Fun.SavedMotors[rootJoint] = {C0 = rootJoint.C0, C1 = rootJoint.C1}
@@ -2425,7 +2472,9 @@ local function ApplySpin360()
                     -- X/Y/Z 三轴叠加, 倍率不同让旋转方向不重复 (无死角)
                     local ang = Fun.Spin360Angle
                     rootJoint.C0 = Fun.SavedMotors[rootJoint].C0
-                        * CFrame.Angles(ang,        ang * 0.7,  ang * 1.3)
+                        * CFrame.Angles(ang, ang * 0.7, ang * 1.3)
+                    -- 同时覆盖 Transform 防动画包把身体拉回 (动画写Transform, 我们覆盖)
+                    rootJoint.Transform = CFrame.Angles(ang, ang * 0.7, ang * 1.3)
                 end)
             else
                 -- 兜底: 直接旋转 HRP (会改变碰撞朝向, 仅在找不到 RootJoint 时)
@@ -2438,11 +2487,13 @@ local function ApplySpin360()
         -- 恢复 RootJoint
         local char = LocalPlayer.Character
         if char then
-            local rootJoint = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("RootJoint") or
-                              (char:FindFirstChild("LowerTorso") and char.LowerTorso:FindFirstChild("Root")) or
-                              (char:FindFirstChild("Torso") and char.Torso:FindFirstChild("RootJoint"))
+            local rootJoint = FindRootJoint(char)
             if rootJoint and Fun.SavedMotors[rootJoint] then
-                pcall(function() rootJoint.C0 = Fun.SavedMotors[rootJoint].C0; rootJoint.C1 = Fun.SavedMotors[rootJoint].C1 end)
+                pcall(function()
+                    rootJoint.C0 = Fun.SavedMotors[rootJoint].C0
+                    rootJoint.C1 = Fun.SavedMotors[rootJoint].C1
+                    rootJoint.Transform = CFrame.new()
+                end)
                 Fun.SavedMotors[rootJoint] = nil
             end
         end
@@ -2475,6 +2526,8 @@ local function ApplyFakeRagdoll()
         local hum = GetHum(); local hrp = GetHRP()
         if hum and char then
             if not Fun.SavedRagdollState then Fun.SavedRagdollState = hum:GetState() end
+            -- 停止动画 (防R15动画包持续驱动Motor6D Transform, 导致四肢不瘫软)
+            StopAllAnimations(hum)
             -- PlatformStand + 物理倒地 (碰撞体积改变, 名字Billboard跟随身体)
             hum.PlatformStand = true
             hum.AutoRotate = false
@@ -2547,6 +2600,16 @@ local function ApplyFakeRagdoll()
             if not h or not hum then return end
             -- 持续保持趴下状态
             if hum.PlatformStand == false then hum.PlatformStand = true end
+            -- 周期性停止动画 (R15动画包可能重新播放, 把已禁用的Motor6D驱动起来)
+            Fun._ragdollStopTick = (Fun._ragdollStopTick or 0) + dt
+            if Fun._ragdollStopTick > 2 then
+                Fun._ragdollStopTick = 0
+                StopAllAnimations(hum)
+                -- 重新禁用可能被动画包重新启用的 Motor6D
+                for m, _ in pairs(Fun.SavedMotors) do
+                    pcall(function() if m and m.Parent then m.Enabled = false end end)
+                end
+            end
             -- 检测是否着地 (向下射线 3 stud 内有碰撞物 = 着地)
             local grounded = false
             pcall(function()
